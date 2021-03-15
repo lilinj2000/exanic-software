@@ -5,7 +5,8 @@
 #ifndef EXANIC_CONFIG_H
 #define EXANIC_CONFIG_H
 
-#include <arpa/inet.h>
+#include <unistd.h> /* for ssize_t */
+#include <arpa/inet.h> /* for in_addr_t */
 
 #include "exanic.h"
 
@@ -24,7 +25,7 @@ typedef struct exanic_if_addr
 } exanic_if_addr_t;
 
 /**
- * \brief Get the address info for an ierface
+ * \brief Get the address info for an interface
  *
  * \param[in]   exanic
  *      A valid ExaNIC handle

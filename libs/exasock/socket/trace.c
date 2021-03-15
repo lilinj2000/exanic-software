@@ -17,13 +17,21 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <poll.h>
+#include <assert.h>
 
 #include "trace.h"
+#include "../lock.h"
 
 #ifndef NDEBUG
 
 int __trace_enabled = 0;
-int __thread __trace_nest_level = 0;
+static uint32_t trace_flush_lock;
+/* the current tracing thread: initialize with -1 so that the code below doesn't
+ * assume that the program was interrupted on first print.
+ */
+static pid_t __trace_thread = -1;
+
+struct __trace_state __thread __trace_state;
 
 __attribute__((constructor))
 void
@@ -171,6 +179,9 @@ struct __trace_enum_table __trace_bits_msg_flags[] =
     {MSG_WAITALL, "MSG_WAITALL"},
     {MSG_ERRQUEUE, "MSG_ERRQUEUE"},
     {MSG_NOSIGNAL, "MSG_NOSIGNAL"},
+#ifdef MSG_WAITFORONE
+    {MSG_WAITFORONE, "MSG_WAITFORONE"},
+#endif
     {0, NULL}
 };
 
@@ -215,19 +226,93 @@ struct __trace_enum_table __trace_bits_epoll_events[] =
     {0, NULL}
 };
 
+static void
+__trace_vprintf_immediate(bool returning, const char *fmt, va_list args)
+{
+    exa_lock(&trace_flush_lock);
+    pid_t curr_thread = exa_sys_get_tid(),
+          last_thread = __trace_thread;
+
+    /* we've interrupted someone */
+    bool interrupting =
+        (curr_thread != last_thread && last_thread != -1);
+    /* someone interrupted us */
+    bool resuming = (curr_thread != last_thread) && __trace_started;
+    /* should prefix with thread ID */
+    bool print_pid = resuming || interrupting || !__trace_started;
+
+    if (interrupting)
+        fprintf(stderr, " "TRACE_UNFINISHED"\n");
+
+    if (print_pid)
+        fprintf(stderr, TRACE_PID" ", curr_thread);
+
+    if (resuming)
+        fprintf(stderr, TRACE_RESUMED" ",
+            __trace_in_handler ? "(sig handler)" :
+                                 __trace_curr_func);
+    vfprintf(stderr, fmt, args);
+    if (returning)
+        __trace_thread = -1;
+    else
+    {
+        __trace_thread = curr_thread;
+        __trace_started = true;
+    }
+
+    exa_unlock(&trace_flush_lock);
+    fflush(stderr);
+}
+
+static void
+__trace_printf_immediate(bool returning, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    __trace_vprintf_immediate(returning, fmt, ap);
+    va_end(ap);
+}
+
+void
+__trace_flush(bool returning)
+{
+    if (!__trace_buffer_size)
+        return;
+
+    __trace_printf_immediate(returning, "%.*s",
+                             __trace_buffer_size, __trace_buffer);
+    __trace_buffer_size = 0;
+}
+
 void
 __trace_printf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stdout, fmt, ap);
+    size_t len = vsnprintf(NULL, 0, fmt, ap);
     va_end(ap);
-}
 
-void
-__trace_flush(void)
-{
-    fflush(stdout);
+    /* string too long to fit in temp buffer?
+     * print immediately */
+    if (len >= __trace_buffer_cap)
+    {
+        __trace_flush(false);
+        va_start(ap, fmt);
+        __trace_vprintf_immediate(false, fmt, ap);
+        va_end(ap);
+        return;
+    }
+
+    if (__trace_buffer_size + len >= __trace_buffer_cap)
+        __trace_flush(false);
+
+    va_start(ap, fmt);
+    vsnprintf(__trace_buffer + __trace_buffer_size,
+              __trace_buffer_cap - __trace_buffer_size - 1,
+              fmt, ap);
+    va_end(ap);
+
+    __trace_buffer_size += len;
 }
 
 void
@@ -380,6 +465,39 @@ __trace_print_msghdr(const struct msghdr *msg, ssize_t len)
         __trace_print_bits(msg->msg_flags, __trace_bits_msg_flags);
     }
 }
+
+#ifdef MSG_WAITFORONE
+void
+__trace_print_mmsghdr(const struct mmsghdr *msgs, ssize_t len)
+{
+    unsigned int i = 0;
+
+    if (msgs == NULL)
+        __trace_printf("NULL");
+    else if (len < 0)
+        __trace_printf("%p", msgs);
+    else
+    {
+        __trace_printf("{");
+        for (i = 0; i < len; i++)
+        {
+            __trace_printf("{msg_name(%d)=", msgs[i].msg_hdr.msg_namelen);
+            __trace_print_sockaddr(msgs[i].msg_hdr.msg_name);
+            __trace_printf(", msg_iov(%ld)=", msgs[i].msg_hdr.msg_iovlen);
+            __trace_print_iovec(msgs[i].msg_hdr.msg_iov, msgs[i].msg_hdr.msg_iovlen, msgs[i].msg_len);
+            __trace_printf(", msg_control(%ld)=", msgs[i].msg_hdr.msg_controllen);
+            if (msgs[i].msg_hdr.msg_control == NULL)
+                __trace_printf("NULL");
+            else
+                __trace_printf("%p", msgs[i].msg_hdr.msg_control);
+            __trace_printf(", msg_flags=");
+            __trace_print_bits(msgs[i].msg_hdr.msg_flags, __trace_bits_msg_flags);
+            __trace_printf(i == len - 1 ? "}" : "}, ");
+        }
+        __trace_printf("}");
+    }
+}
+#endif
 
 void
 __trace_print_iovec(const struct iovec *iov, size_t iovcnt, ssize_t len)

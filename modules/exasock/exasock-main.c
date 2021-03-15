@@ -22,8 +22,12 @@
 #include "../exanic/exanic.h"
 #include "exasock.h"
 #include "exasock-stats.h"
+#include "exasock-bonding-priv.h"
+
+bool module_removed;
 
 static struct exasock_kernel_info *exasock_info_page;
+static struct file_operations exasock_fops;
 
 static int exasock_net_event(struct notifier_block *notifier,
                              unsigned long event, void *ptr)
@@ -128,7 +132,7 @@ static void exasock_socket_free(struct exasock_hdr *common)
     }
     else if (socket->domain == AF_INET && socket->type == SOCK_STREAM)
     {
-        exasock_tcp_free((struct exasock_tcp *)common);
+        exasock_tcp_close((struct exasock_tcp *)common);
         return;
     }
 
@@ -413,13 +417,51 @@ static long exasock_dev_ioctl(struct file *filp, unsigned int cmd,
 
             socket = &priv->socket;
             if (socket->domain == AF_INET && socket->type == SOCK_STREAM)
-                exasock_tcp_update((struct exasock_tcp *)priv,
-                                   req.local_addr, req.local_port,
-                                   req.peer_addr, req.peer_port);
+                return exasock_tcp_update((struct exasock_tcp *)priv,
+                                           req.local_addr, req.local_port,
+                                           req.peer_addr, req.peer_port);
             else
                 return -EINVAL;
+        }
 
-            return 0;
+    case EXASOCK_IOCTL_ATE_ENABLE:
+        {
+            struct exasock_hdr *priv = filp->private_data;
+            struct exasock_hdr_socket *socket;
+            int ate_id;
+
+            if (copy_from_user(&ate_id, (void *)arg, sizeof(ate_id)) != 0)
+                return -EFAULT;
+
+            if (priv == NULL)
+                return -EINVAL;
+
+            if (priv->type != EXASOCK_TYPE_SOCKET)
+                return -EINVAL;
+
+            socket = &priv->socket;
+            if (socket->domain == AF_INET && socket->type == SOCK_STREAM)
+                return exasock_ate_enable((struct exasock_tcp *)priv, ate_id);
+            else
+                return -EINVAL;
+        }
+
+    case EXASOCK_IOCTL_ATE_INIT:
+        {
+            struct exasock_hdr *priv = filp->private_data;
+            struct exasock_hdr_socket *socket;
+
+            if (priv == NULL)
+                return -EINVAL;
+
+            if (priv->type != EXASOCK_TYPE_SOCKET)
+                return -EINVAL;
+
+            socket = &priv->socket;
+            if (socket->domain == AF_INET && socket->type == SOCK_STREAM)
+                return exasock_ate_init((struct exasock_tcp *)priv);
+            else
+                return -EINVAL;
         }
 
     case EXASOCK_IOCTL_SETSOCKOPT:
@@ -514,8 +556,10 @@ static long exasock_dev_ioctl(struct file *filp, unsigned int cmd,
     case EXASOCK_IOCTL_EPOLL_CTL:
         {
             struct exasock_epoll_ctl_request req;
-            void *priv = filp->private_data;
-            enum exasock_type type;
+            struct exasock_epoll *priv = filp->private_data;
+            struct file *sock_filp;
+            struct exasock_hdr *sock_priv;
+            int err;
 
             if (copy_from_user(&req, (void *)arg, sizeof(req)) != 0)
                 return -EFAULT;
@@ -523,15 +567,66 @@ static long exasock_dev_ioctl(struct file *filp, unsigned int cmd,
             if (priv == NULL)
                 return -EINVAL;
 
-            type = *((enum exasock_type *)priv);
-            if (type != EXASOCK_TYPE_EPOLL)
+            if (priv->type != EXASOCK_TYPE_EPOLL)
                 return -EINVAL;
 
-            return exasock_epoll_ctl((struct exasock_epoll *)priv,
-                                    (req.op == EXASOCK_EPOLL_CTL_ADD),
-                                    req.local_addr, req.local_port, req.fd);
+            sock_filp = fget(req.fd);
+            if (sock_filp == NULL)
+                return -EINVAL;
+
+            sock_priv = sock_filp->private_data;
+
+            if (sock_filp->f_op != &exasock_fops || sock_priv == NULL ||
+                sock_priv->type != EXASOCK_TYPE_SOCKET)
+            {
+                fput(sock_filp);
+                return -EINVAL;
+            }
+
+            if (sock_priv->socket.domain == AF_INET &&
+                sock_priv->socket.type == SOCK_STREAM)
+            {
+                if (req.op == EXASOCK_EPOLL_CTL_ADD)
+                    err = exasock_tcp_epoll_add((struct exasock_tcp *)sock_priv,
+                                                priv, req.fd);
+                else if (req.op == EXASOCK_EPOLL_CTL_DEL)
+                    err = exasock_tcp_epoll_del((struct exasock_tcp *)sock_priv,
+                                                priv);
+                else
+                    err = -EINVAL;
+
+                fput(sock_filp);
+                return err;
+            }
+            else
+            {
+                fput(sock_filp);
+                return -EINVAL;
+            }
         }
 
+    case EXASOCK_IOCTL_ISN_ALLOC:
+        {
+            struct exasock_hdr *priv = filp->private_data;
+            struct exasock_hdr_socket *socket;
+            uint32_t isn;
+
+            if (!priv)
+                return -EINVAL;
+
+            if (priv->type != EXASOCK_TYPE_SOCKET)
+                return -EINVAL;
+
+            socket = &priv->socket;
+            if (socket->domain != AF_INET || socket->type != SOCK_STREAM)
+                return -EINVAL;
+
+            isn = exasock_tcp_get_isn((struct exasock_tcp *)priv);
+            if (copy_to_user((void*)arg, &isn, sizeof(isn)))
+                return -EFAULT;
+
+            return 0;
+        }
     default:
         return -ENOTTY;
     }
@@ -559,7 +654,6 @@ static struct file_operations exasock_fops = {
 static int __init exasock_init(void)
 {
     int err;
-
     /* Allocate destination table */
     err = exasock_dst_init();
     if (err)
@@ -605,9 +699,21 @@ static int __init exasock_init(void)
     /* Notifier for monitoring IP address changes */
     register_inetaddr_notifier(&exasock_inetaddr_notifier);
 
+    /* Initialize bonding if supported. */
+    err = exabond_init(&exabond);
+    if (err)
+    {
+        pr_err("Bonding support failed to initialize.\n");
+        goto err_bonding;
+    }
+
     pr_info("ExaSock kernel support (ver " DRV_VERSION ") loaded.\n");
     return 0;
 
+err_bonding:
+    unregister_netevent_notifier(&exasock_net_notifier);
+    unregister_inetaddr_notifier(&exasock_inetaddr_notifier);
+    misc_deregister(&exasock_dev);
 err_miscdev:
     vfree(exasock_info_page);
 err_vmalloc:
@@ -628,13 +734,16 @@ module_init(exasock_init);
  */
 static void __exit exasock_exit(void)
 {
+    module_removed = true;
+    exabond_destroy(&exabond);
     unregister_netevent_notifier(&exasock_net_notifier);
     unregister_inetaddr_notifier(&exasock_inetaddr_notifier);
     misc_deregister(&exasock_dev);
     exasock_stats_exit();
+    /* tcp exit might still send data */
+    exasock_tcp_exit();
     exasock_dst_exit();
     exasock_udp_exit();
-    exasock_tcp_exit();
     vfree(exasock_info_page);
 
     pr_info("ExaSock kernel support unloaded.\n");

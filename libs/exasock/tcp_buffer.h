@@ -10,17 +10,17 @@ seq_compare(uint32_t a, uint32_t b)
 }
 
 static inline bool
-proc_seq_update(uint32_t *proc_seq, uint32_t *old, uint32_t new)
+proc_seq_update(uint32_t *proc_seq, uint32_t *old_seq, uint32_t new_seq)
 {
     uint32_t prev;
 
     do
     {
-        prev = __sync_val_compare_and_swap(proc_seq, *old, new);
-        if (prev == *old)
+        prev = __sync_val_compare_and_swap(proc_seq, *old_seq, new_seq);
+        if (prev == *old_seq)
             return true;
-        *old = prev;
-    } while (seq_compare(new, *old) > 0);
+        *old_seq = prev;
+    } while (seq_compare(new_seq, *old_seq) > 0);
 
     return false;
 }
@@ -458,6 +458,7 @@ exa_tcp_tx_buffer_write(struct exa_socket * restrict sock,
 
     tcp->adv_wnd_end = tcp->wnd_end_pending;
     tcp->send_seq = send_seq + send_len;
+    tcp->tx_consistent = 1;
 }
 
 /* Get data from the tx buffer as an iovec */
@@ -491,7 +492,7 @@ exa_tcp_tx_buffer_empty(struct exa_socket * restrict sock)
 {
     struct exa_tcp_state * restrict tcp = &sock->state->p.tcp;
 
-    return (tcp->send_ack == tcp->send_seq);
+    return seq_compare(tcp->send_seq, tcp->send_ack) <= 0;
 }
 
 #endif /* EXASOCK_TCP_BUFFER_H */

@@ -26,6 +26,16 @@
 #define __HAS_OLD_HLIST_ITERATOR
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+#define __GETNAME_NO_SOCKLEN_PARAM
+#endif
+
+/* Linux v5.9+ introduces a sockptr_t type and the constructor function
+ * USER_SOCKPTR(p), prior to this setsockopt() accepts a pointer directly */
+#ifndef _LINUX_SOCKPTR_H
+#define USER_SOCKPTR(p) (p)
+#endif
+
 struct exasock_udp
 {
     struct exasock_hdr          hdr;
@@ -160,20 +170,28 @@ struct exasock_udp *exasock_udp_alloc(struct socket *sock, int fd)
     /* Get local and peer addresses from native socket */
     slen = sizeof(local);
     memset(&local, 0, sizeof(local));
+#ifdef __GETNAME_NO_SOCKLEN_PARAM
+    err = slen = sock->ops->getname(sock, (struct sockaddr *)&local, 0);
+#else
     err = sock->ops->getname(sock, (struct sockaddr *)&local, &slen, 0);
-    if (err)
+#endif
+    if (err < 0)
         goto err_sock_getname;
 
     slen = sizeof(peer);
     memset(&peer, 0, sizeof(peer));
+#ifdef __GETNAME_NO_SOCKLEN_PARAM
+    err = slen = sock->ops->getname(sock, (struct sockaddr *)&peer, 1);
+#else
     err = sock->ops->getname(sock, (struct sockaddr *)&peer, &slen, 1);
+#endif
     if (err == -ENOTCONN)
     {
         peer.sin_family = AF_INET;
         peer.sin_addr.s_addr = htonl(INADDR_ANY);
         peer.sin_port = 0;
     }
-    else if (err)
+    else if (err < 0)
         goto err_sock_getname;
 
     /* Allocate structs and buffers */
@@ -249,8 +267,12 @@ int exasock_udp_bind(struct exasock_udp *udp, uint32_t local_addr,
     /* Get assigned port from native socket */
     slen = sizeof(sa);
     memset(&sa, 0, sizeof(sa));
+#ifdef __GETNAME_NO_SOCKLEN_PARAM
+    err = slen = udp->sock->ops->getname(udp->sock, (struct sockaddr *)&sa, 0);
+#else
     err = udp->sock->ops->getname(udp->sock, (struct sockaddr *)&sa, &slen, 0);
-    if (err)
+#endif
+    if (err < 0)
         return err;
 
     udp->user_page->e.ip.local_addr = udp->local_addr = sa.sin_addr.s_addr;
@@ -290,8 +312,12 @@ int exasock_udp_connect(struct exasock_udp *udp, uint32_t *local_addr,
     /* Get assigned local address and port from native socket */
     slen = sizeof(sa);
     memset(&sa, 0, sizeof(sa));
+#ifdef __GETNAME_NO_SOCKLEN_PARAM
+    err = slen = udp->sock->ops->getname(udp->sock, (struct sockaddr *)&sa, 0);
+#else
     err = udp->sock->ops->getname(udp->sock, (struct sockaddr *)&sa, &slen, 0);
-    if (err)
+#endif
+    if (err < 0)
         return err;
 
     udp->user_page->e.ip.local_addr = udp->local_addr = sa.sin_addr.s_addr;
@@ -448,7 +474,10 @@ int exasock_udp_setsockopt(struct exasock_udp *udp, int level, int optname,
     BUG_ON(udp->hdr.socket.domain != AF_INET);
     BUG_ON(udp->hdr.socket.type != SOCK_DGRAM);
 
-    ret = udp->sock->ops->setsockopt(udp->sock, level, optname, optval, optlen);
+    if (level == SOL_SOCKET)
+        ret = sock_setsockopt(udp->sock, level, optname, USER_SOCKPTR(optval), optlen);
+    else
+        ret = udp->sock->ops->setsockopt(udp->sock, level, optname, USER_SOCKPTR(optval), optlen);
 
     return ret;
 }
@@ -456,19 +485,11 @@ int exasock_udp_setsockopt(struct exasock_udp *udp, int level, int optname,
 int exasock_udp_getsockopt(struct exasock_udp *udp, int level, int optname,
                            char __user *optval, unsigned int *optlen)
 {
-    int ret;
-    mm_segment_t old_fs;
-
     BUG_ON(udp->hdr.type != EXASOCK_TYPE_SOCKET);
     BUG_ON(udp->hdr.socket.domain != AF_INET);
     BUG_ON(udp->hdr.socket.type != SOCK_DGRAM);
 
-    old_fs = get_fs();
-    set_fs(KERNEL_DS);
-    ret = udp->sock->ops->getsockopt(udp->sock, level, optname, optval, optlen);
-    set_fs(old_fs);
-
-    return ret;
+    return udp->sock->ops->getsockopt(udp->sock, level, optname, optval, optlen);
 }
 
 int __init exasock_udp_init(void)

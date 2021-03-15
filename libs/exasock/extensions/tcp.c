@@ -31,13 +31,6 @@
 
 __attribute__((visibility("default")))
 int
-exasock_loaded(void)
-{
-    return 1;
-}
-
-__attribute__((visibility("default")))
-int
 exasock_tcp_get_device(int fd, char *dev, size_t dev_len, int *port_num)
 {
     struct exa_socket * restrict sock = exa_socket_get(fd);
@@ -52,17 +45,15 @@ exasock_tcp_get_device(int fd, char *dev, size_t dev_len, int *port_num)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass || sock->domain != AF_INET ||
-            sock->type != SOCK_STREAM)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE
+            || sock->domain != AF_INET
+            || sock->type != SOCK_STREAM)
         {
             errno = EOPNOTSUPP;
             ret = -1;
         }
         else
-        {
-            exanic_tcp_get_device(sock, dev, dev_len, port_num);
-            ret = 0;
-        }
+            ret = exanic_tcp_get_device(sock, dev, dev_len, port_num);
 
         exa_read_unlock(&sock->lock);
     }
@@ -87,8 +78,9 @@ exasock_tcp_build_header(int fd, void *buf, size_t len, size_t offset,
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass || sock->domain != AF_INET ||
-            sock->type != SOCK_STREAM)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE
+            || sock->domain != AF_INET
+            || sock->type != SOCK_STREAM)
         {
             errno = EOPNOTSUPP;
             ret = -1;
@@ -100,14 +92,23 @@ exasock_tcp_build_header(int fd, void *buf, size_t len, size_t offset,
         }
         else
         {
+            bool closed;
             /* Generate all headers */
             exa_lock(&sock->state->tx_lock);
-            ret = exanic_tcp_build_hdr(sock, buf, len);
-            exa_unlock(&sock->state->tx_lock);
+            ret = exanic_tcp_build_hdr(sock, buf, len, &closed);
 
-            /* Error indicates that the neighbour lookup is not yet complete */
+            /* Error indicates that the neighbour lookup is not yet complete,
+             * or the connection is not yet established or already closed */
             if (ret == -1)
-                errno = EAGAIN;
+                errno = closed ? EPIPE : EAGAIN;
+            /* set the flag this early because this is the only
+             * extension API function before send_advance, which
+             * sets the tx_consistent flag, that takes the file
+             * descriptor */
+            else
+                sock->state->p.tcp.tx_consistent = 0;
+
+            exa_unlock(&sock->state->tx_lock);
         }
 
         exa_read_unlock(&sock->lock);
@@ -172,8 +173,9 @@ exasock_tcp_send_advance(int fd, const void *data, size_t data_len)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass || sock->domain != AF_INET ||
-            sock->type != SOCK_STREAM)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE
+            || sock->domain != AF_INET
+            || sock->type != SOCK_STREAM)
         {
             errno = EOPNOTSUPP;
             ret = -1;

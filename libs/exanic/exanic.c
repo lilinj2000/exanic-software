@@ -11,6 +11,7 @@
 
 #include "exanic.h"
 #include "pcie_if.h"
+#include "hw_info.h"
 #include "ioctl.h"
 
 static exanic_t *exanic_list = NULL;
@@ -73,6 +74,12 @@ exanic_t * exanic_acquire_handle(const char *device_name)
 
     uint32_t caps = registers[REG_EXANIC_INDEX(REG_EXANIC_CAPS)];
     uint32_t tick_hz = registers[REG_EXANIC_INDEX(REG_EXANIC_CLK_HZ)];
+    uint32_t hwid = registers[REG_EXANIC_INDEX(REG_EXANIC_HW_ID)];
+
+    /* Find hardware information from device table */
+    struct exanic_hw_info hwinfo;
+    memset(&hwinfo, 0, sizeof hwinfo);
+    exanic_get_hw_info(hwid, &hwinfo);
 
     /* Map info page */
     struct exanic_info_page *info_page = mmap(NULL,
@@ -130,7 +137,7 @@ exanic_t * exanic_acquire_handle(const char *device_name)
     }
 
     /* Map devkit regions if available. */
-    struct exanicctl_devkit_info devkit_info;
+    struct exanicctl_devkit_info devkit_info = {0, 0};
     uint32_t *devkit_regs_region = NULL;
     void *devkit_mem_region = NULL;
 
@@ -155,8 +162,40 @@ exanic_t * exanic_acquire_handle(const char *device_name)
                                 EXANIC_PGOFF_DEVKIT_MEM * PAGE_SIZE);
             if (devkit_mem_region == MAP_FAILED)
             {
-                exanic_err_printf("devkit regs mmap failed: %s", strerror(errno));
+                exanic_err_printf("devkit memory mmap failed: %s", strerror(errno));
                 goto err_mmap_devkit_mem;
+            }
+        }
+    }
+
+    /* Map extended devkit regions if available */
+    struct exanicctl_devkit_info devkit_info_ex = {0, 0};
+    uint32_t *devkit_regs_ex_region = NULL;
+    void *devkit_mem_ex_region = NULL;
+
+    if (ioctl(fd, EXANICCTL_DEVKIT_INFO_EX, &devkit_info_ex) == 0)
+    {
+        if (devkit_info_ex.regs_size > 0)
+        {
+             devkit_regs_ex_region = mmap(NULL, devkit_info_ex.regs_size,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                                EXANIC_PGOFF_DEVKIT_REGS_EXT * PAGE_SIZE);
+            if (devkit_regs_ex_region == MAP_FAILED)
+            {
+                exanic_err_printf("extended devkit regs mmap failed: %s", strerror(errno));
+                goto err_mmap_devkit_regs_ex;
+            }
+        }
+
+        if (devkit_info_ex.mem_size > 0)
+        {
+             devkit_mem_ex_region = mmap(NULL, devkit_info_ex.mem_size,
+                                PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                                EXANIC_PGOFF_DEVKIT_MEM_EXT * PAGE_SIZE);
+            if (devkit_mem_ex_region == MAP_FAILED)
+            {
+                exanic_err_printf("extended devkit memory mmap failed: %s", strerror(errno));
+                goto err_mmap_devkit_mem_ex;
             }
         }
     }
@@ -171,6 +210,10 @@ exanic_t * exanic_acquire_handle(const char *device_name)
     exanic->devkit_regs_size = devkit_info.regs_size;
     exanic->devkit_mem_region = devkit_mem_region;
     exanic->devkit_mem_size = devkit_info.mem_size;
+    exanic->devkit_regs_ex_region = devkit_regs_ex_region;
+    exanic->devkit_regs_ex_size = devkit_info_ex.regs_size;
+    exanic->devkit_mem_ex_region = devkit_mem_ex_region;
+    exanic->devkit_mem_ex_size = devkit_info_ex.mem_size;
     exanic->tx_buffer = tx_buffer;
     exanic->tx_buffer_size = info.tx_buffer_size;
     exanic->filters = filters;
@@ -183,6 +226,7 @@ exanic_t * exanic_acquire_handle(const char *device_name)
     exanic->name[sizeof(exanic->name) - 1] = '\0';
     exanic->num_ports = (info.num_ports > EXANIC_MAX_PORTS) ?
                            EXANIC_MAX_PORTS : info.num_ports;
+    exanic->hw_info = hwinfo;
 
     for (i = 0; i < exanic->num_ports; i++)
         exanic->if_index[i] = info.if_index[i];
@@ -193,8 +237,14 @@ exanic_t * exanic_acquire_handle(const char *device_name)
     exanic_list = exanic;
     return exanic;
 
+err_mmap_devkit_mem_ex:
+    if (devkit_regs_ex_region != NULL)
+        munmap(devkit_regs_ex_region, devkit_info_ex.regs_size);
+err_mmap_devkit_regs_ex:
+    if (devkit_mem_region != NULL)
+        munmap(devkit_mem_region, devkit_info.mem_size);
 err_mmap_devkit_mem:
-    if (filters != NULL)
+    if (devkit_regs_region != NULL)
         munmap(devkit_regs_region, devkit_info.regs_size);
 err_mmap_devkit_regs:
     if (filters != NULL)
@@ -242,6 +292,10 @@ void exanic_release_handle(exanic_t *exanic)
         }
 
     /* Unmap buffers and free the exanic struct */
+    if (exanic->devkit_mem_ex_region != NULL)
+        munmap((void *)exanic->devkit_mem_ex_region, exanic->devkit_mem_ex_size);
+    if (exanic->devkit_regs_ex_region != NULL)
+        munmap((void *)exanic->devkit_regs_ex_region, exanic->devkit_regs_ex_size);
     if (exanic->devkit_mem_region != NULL)
         munmap((void *)exanic->devkit_mem_region, exanic->devkit_mem_size);
     if (exanic->devkit_regs_region != NULL)

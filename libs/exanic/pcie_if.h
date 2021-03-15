@@ -21,53 +21,65 @@
 enum
 {
     /** Registers are at this BAR */
-    EXANIC_REGS_BAR                 = 0,
+    EXANIC_REGS_BAR                         = 0,
 
     /** TX region is at this BAR */
-    EXANIC_TX_REGION_BAR            = 2,
+    EXANIC_TX_REGION_BAR                    = 2,
 
     /** The number of 4K pages for mapping the ExaNIC registers */
-    EXANIC_REGS_NUM_PAGES           = 2,
+    EXANIC_REGS_NUM_PAGES                   = 2,
 
     /** The number of 4K pages for the ExaNIC info region */
-    EXANIC_INFO_NUM_PAGES           = 1,
+    EXANIC_INFO_NUM_PAGES                   = 1,
 
     /** The number of 4K pages for a TX feedback region */
-    EXANIC_TX_FEEDBACK_NUM_PAGES    = 1,
+    EXANIC_TX_FEEDBACK_NUM_PAGES            = 1,
 
     /** The number of TX feedback slots per ExaNIC */
-    EXANIC_TX_FEEDBACK_NUM_SLOTS    = 256,
+    EXANIC_TX_FEEDBACK_NUM_SLOTS            = 256,
+
+    /** The number of Accelerated TCP engines */
+    EXANIC_ATE_ENGINES_PER_PORT             = 512,
+
+    /** The `matched filter` ID for reflected ATE transmissions */
+    EXANIC_ATE_FILTER_REFLECTED             = 1,
 
     /** TX region size divided by the number of TX command FIFO entries */
-    EXANIC_TX_CMD_FIFO_SIZE_DIVISOR = 512,
+    EXANIC_TX_CMD_FIFO_SIZE_DIVISOR         = 512,
 
     /** The maximum number of 4K pages for a ExaNIC TX region. */
-    EXANIC_TX_REGION_MAX_NUM_PAGES  = 512,  /* 2M */
+    EXANIC_TX_REGION_MAX_NUM_PAGES          = 512,  /* 2M */
 
     /** Number of DWORDs for a filter component. */
-    EXANIC_FILTER_NUM_DWORDS        = 11,   /* 44 bytes */
+    EXANIC_FILTER_NUM_DWORDS                = 11,   /* 44 bytes */
 
     /** The size of an RX chunk including the metadata (in bytes) */
-    EXANIC_RX_CHUNK_SIZE            = 128,
+    EXANIC_RX_CHUNK_SIZE                    = 128,
 
     /** The size of an RX chunk without the metadata (in bytes) */
-    EXANIC_RX_CHUNK_PAYLOAD_SIZE    = 120,
+    EXANIC_RX_CHUNK_PAYLOAD_SIZE            = 120,
 
     /** The number of 4K pages for an RX DMA region */
-    EXANIC_RX_DMA_NUM_PAGES         = 512,  /* 2M */
+    EXANIC_RX_DMA_NUM_PAGES                 = 512,  /* 2M */
 
     /** The number of RX chunks in a RX DMA region. Must be a power of 2. */
-    EXANIC_RX_NUM_CHUNKS            = EXANIC_RX_DMA_NUM_PAGES * PAGE_SIZE /
-                                      EXANIC_RX_CHUNK_SIZE,
+    EXANIC_RX_NUM_CHUNKS                    = EXANIC_RX_DMA_NUM_PAGES * PAGE_SIZE /
+                                              EXANIC_RX_CHUNK_SIZE,
 
     /** Number of filters in each bank. */
-    EXANIC_NUM_FILTERS_PER_BANK     = 32,
+    EXANIC_NUM_FILTERS_PER_BANK             = 32,
 
     /** Number of filters in each filter region. */
-    EXANIC_NUM_FILTERS_PER_REGION   = 256,
+    EXANIC_NUM_FILTERS_PER_REGION           = 256,
 
     /** Devkit memory region is at this BAR. */
-    EXANIC_DEVKIT_MEMORY_REGION_BAR = 2,
+    EXANIC_DEVKIT_MEMORY_REGION_BAR         = 2,
+
+    /** Extended devkit register region is at this BAR. */
+    EXANIC_DEVKIT_REGISTERS_EX_REGION_BAR   = 1,
+
+    /** Extended devkit memory region is at this BAR. */
+    EXANIC_DEVKIT_MEMORY_EX_REGION_BAR      = 4,
 };
 
 /**
@@ -95,6 +107,7 @@ enum
      * (see \ref exanic_feature_cfg_t)
      * Availability: NIC only
      * Bitmap:
+     * [18]   - [RO] DDR4 fitted to this PCB (X25, X100 only)
      * [17]   - [RO] HW startup in progress
      * [16]   - [RW] Set to 0 to permanently clear the auxiliary enable signals
      * [15]   - reserved
@@ -196,6 +209,17 @@ enum
      */
     REG_EXANIC_CLK_ADJ_EXT              = 17,
 
+    /*
+     * [WO] Flash LEDs for specified number of seconds.
+     */
+    REG_EXANIC_IDENTIFY_TIMER           = 18,
+
+    /**
+     * [RO] Per-port Accelerated TCP Engine availability. If a bit is
+     * set, the corresponding port has ATE.
+     */
+    REG_EXANIC_PORTS_ATE_STATUS         = 19,
+
     /**
      * [RW] Bi-color LED control
      * Bit 0 - Green LED on
@@ -206,7 +230,6 @@ enum
     /**
      * [RO] The number of DMA buffers supported per port when using
      * flow hashing or flow steering.
-     * Availability: X4, X2
      */
     REG_EXANIC_NUM_FILTER_BUFFERS       = 33,
 
@@ -223,10 +246,10 @@ enum
     REG_EXANIC_DEVKIT_MEMORY_OFFSET     = 35,
 
     /**
-     * [RO] Reads 1 if this is a time-limited demo devkit image.
+     * [RO] FDK license type: 0=licensed/full, 1=evaluation, 2=free.
      * Availability: ExaNIC Development Kits
      */
-    REG_EXANIC_DEVKIT_DEMO_IMAGE        = 36,
+    REG_EXANIC_DEVKIT_LICENSE_TYPE      = 36,
 
     /**
      * [RO] For devkit images, this is the user version provided in at compile
@@ -234,6 +257,13 @@ enum
      * Availability: ExaNIC Development Kits
      */
     REG_EXANIC_DEVKIT_USER_VERSION      = 37,
+
+    /**
+     * [RO] For devkit images, this is a run-time or compile-time configurable id
+     * provided by custom logic from within the user_application wrapper.
+     * Availability: ExaNIC Development Kits
+     */
+    REG_EXANIC_DEVKIT_APPLICATION_ID    = 43,
 };
 #define REG_EXANIC_OFFSET(reg) (REG_EXANIC_BASE + (reg) * sizeof(uint32_t))
 #define REG_EXANIC_INDEX(reg) (REG_EXANIC_OFFSET(reg) / sizeof(uint32_t))
@@ -255,81 +285,67 @@ enum
      */
     REG_HW_RELOAD_RESET_FPGA            = 0,
 
-    /**
-     * [RW] Registers for JTAG programming.
-     * Availability: Z1 only
-     */
-    REG_HW_JTAG_TMS                     = 0,
-
     REG_HW_JTAG_TDIO                    = 1,
 
     REG_HW_JTAG_SHIFT_COUNT             = 2,
 
     /**
      * [RO] On-die FPGA temperature representation.
-     * Availability: Z1, Z10, X4, X2
+     * Availability: all ExaNICs
      */
     REG_HW_TEMPERATURE                  = 3,
 
     /**
      * [RO] Board version ID
-     * Availability: Z1, Z10, X4, X2
+     * Availability: X4, X2
      */
     REG_HW_BOARD_ID                     = 4,
 
     /**
      * [RO] FPGA core voltage VCCint
-     * Availability: Z1, Z10, X4, X2
+     * Availability: all ExaNICs
      */
     REG_HW_VCCINT                       = 5,
 
     /**
      * [RO] FPGA aux voltage VCCaux
-     * Availability: Z1, Z10, X4, X2
+     * Availability: all ExaNICs
      */
     REG_HW_VCCAUX                       = 6,
 
     /**
-     * [RO] Power detect status bits
-     * Availability: Z10 only
-     */
-    REG_HW_POWERDETECT                  = 7,
-
-    /**
-     * [RO] Used for detecting CPLD ACK
-     * Availability: Z10 only
-     */
-    REG_HW_CPLD_ACK                     = 8,
-
-    /**
-     * [RW] Used to transfer data to/from CPLD
-     * Availability: Z10 only
-     */
-    REG_HW_CPLD_DATA                    = 9,
-
-    /**
-     * [RW] Used to signal a new data transfer to/from CPLD
-     * Availability: Z10 only
-     */
-    REG_HW_CPLD_CMD                     = 10,
-
-    /**
      * [RW] GPIO register for use with I2C
-     * Availability: Z1 only
+     * Availability: all ExaNICs
      */
     REG_HW_I2C_GPIO                     = 11,
-
-    /**
-     * [RW] Z1 100Mb mode enable
-     * Availability: Z1 only
-     */
-    REG_HW_100MB_MODE                   = 12,
 
     /**
      * [RW] Bitmask of PHYs to power down and SFP TX DIS
      * Availability: X4, X2
      */
     REG_HW_POWERDOWN                    = 14,
+
+    /**
+     * [WO] Firmware flash address register
+     */
+    REG_HW_FLASH_ADDR                   = 15,
+
+    /**
+     * [WO] Parallel firmware flash data output register
+     * Availability: all ExaNICs with parallel flash devices
+     */
+    REG_HW_FLASH_DOUT_CFI               = 16,
+
+    /**
+     * [RW] Firmware flash control register
+     */
+    REG_HW_FLASH_CTRL                   = 17,
+
+    /**
+     * [RO] Parallel firmware flash data input register
+     * Availability: all ExaNICs with parallel flash devices
+     */
+    REG_HW_FLASH_DIN_CFI                = 18,
 
     /**
      * [RW] PRBS control (BER testing only)
@@ -408,6 +424,33 @@ enum
     REG_HW_JTAG_TDI_VECTOR              = 35,
     REG_HW_JTAG_TDO_VECTOR              = 36,
     REG_HW_JTAG_CTRL                    = 37,
+
+    /**
+     * [WO] Hardware-accelerated QSPI flash master opcode register
+     * Availability: X100 only
+     */
+    REG_HW_FLASH_QSPI_OPCODE            = 38,
+
+    /**
+     * [RO] SPI firmware flash data output register
+     * Availability: X100 only
+     */
+    REG_HW_FLASH_DOUT_SPI               = 39,
+
+    /**
+     * [RO] SPI firmware flash data input register
+     * Availability: X100 only
+     */
+    REG_HW_FLASH_DIN_SPI                = 40,
+
+    /**
+     * [RO] QSPI device status register
+     * \ref REG_HW_FLASH_DIN_SPI is also used by the QSPI-acceleration
+     * logic to store bits from the device status registers at the end
+     * of an RDSR cycle
+     * Availability: X100 only
+     */
+    REG_HW_FLASH_QSPI_SR                = 40,
 };
 #define REG_HW_OFFSET(reg) (REG_HW_BASE + (reg) * sizeof(uint32_t))
 #define REG_HW_INDEX(reg) (REG_HW_OFFSET(reg) / sizeof(uint32_t))
@@ -421,6 +464,7 @@ enum
 enum
 {
     REG_PORT_BASE                       = 0x0200,
+    REG_PORT_BASE_UPPER                 = 0x1200,
 
     /**
      * [RW] Whether a port is enabled or not.
@@ -525,7 +569,11 @@ enum
     REG_PORT_RESERVED1                  = 15,
 };
 #define REG_PORT_OFFSET(port, reg) \
-    (REG_PORT_BASE + (0x10 * (port) + (reg)) * sizeof(uint32_t))
+    ( port >= 8 ? \
+        (REG_PORT_BASE_UPPER + \
+            (0x10 * (port-8) + (reg)) * sizeof(uint32_t)) : \
+        (REG_PORT_BASE + \
+            (0x10 * (port) + (reg)) * sizeof(uint32_t)))
 #define REG_PORT_INDEX(port, reg) \
     (REG_PORT_OFFSET(port, reg) / sizeof(uint32_t))
 
@@ -537,6 +585,7 @@ enum
 enum
 {
     REG_EXTENDED_PORT_BASE                          = 0x0800,
+    REG_EXTENDED_PORT_BASE_UPPER                    = 0x1800,
 
     /**
      * [RO] The maximum number of IP flow steering rules that can be assigned
@@ -558,10 +607,64 @@ enum
      * Availability: X4, X2
      */
     REG_EXTENDED_PORT_NUM_HASH_FUNCTIONS            = 2,
+
+    /**
+     * [RW] Clause 73 autonegotiation - control
+     * [0] Restart autonegotiation
+     * [8] Disable nonce check to allow loopback
+     * Availability: 25G capable firmware only
+     */
+    REG_EXTENDED_PORT_AN_CONTROL                    = 16,
+
+    /**
+     * [RW] Clause 73 autonegotiation - advertised ability
+     * [10:0] Technology ability
+     * [19:16] FEC capability
+     * [24:20] Tx nonce seed
+     * Availability: 25G capable firmware only
+     */
+    REG_EXTENDED_PORT_AN_ABILITY                    = 17,
+
+    /**
+     * [RO] Clause 73 autonegotiation - status
+     * [0] Autonegotiated link successfully
+     * [8] Link partner supports autonegotiation
+     * [14:12] Resolved PMD (one of PMD_*)
+     * [16] Resolved FEC is BASER-FEC
+     * [17] Resolved FEC is RS-FEC
+     * Availability: 25G capable firmware only
+     */
+    REG_EXTENDED_PORT_AN_STATUS                     = 18,
+
+    /**
+     * [RO] Clause 73 autonegotiation - link partner ability
+     * [10:0] Technology ability
+     * [19:16] FEC capability
+     * Availability: 25G capable firmware only
+     */
+    REG_EXTENDED_PORT_AN_LP_ABILITY                 = 19,
+
+    /**
+     * [RW] Clause 73 autonegotiation - delay before initial link-up check,
+     *  in units of 20ns
+     * Availability: 25G capable firmware only
+     */
+    REG_EXTENDED_PORT_AN_LINK_TIMER                 = 20,
+
+    /**
+     * [RO] Clause 73 autonegotiation - arbiter state (see
+     *  exanic_port_autoneg_arbiter_state_t)
+     * Availability: 25G capable firmware only
+     */
+    REG_EXTENDED_PORT_AN_ARB_STATE                  = 21
 };
 
 #define REG_EXTENDED_PORT_OFFSET(port, reg) \
-    (REG_EXTENDED_PORT_BASE + (0x40 * (port) + (reg)) * sizeof(uint32_t))
+    (port >= 8 ? \
+        (REG_EXTENDED_PORT_BASE_UPPER + \
+            (0x40 * (port-8) + (reg)) * sizeof(uint32_t)) :\
+        (REG_EXTENDED_PORT_BASE + \
+            (0x40 * (port) + (reg)) * sizeof(uint32_t)))
 #define REG_EXTENDED_PORT_INDEX(port, reg) \
     (REG_EXTENDED_PORT_OFFSET(port, reg) / sizeof(uint32_t))
 
@@ -719,6 +822,117 @@ enum
 #define REG_FIREWALL_OFFSET(reg) (REG_FIREWALL_BASE + (reg) * sizeof(uint32_t))
 #define REG_FIREWALL_INDEX(reg) (REG_FIREWALL_OFFSET(reg) / sizeof(uint32_t))
 
+/* bits for REG_ATE_CTL.
+ * ENABLE: enables hardware-injected payload
+ * CHECK_MAX_SEQ: forces the hardware sender to respect the maximum sequence
+ *            number set by writing to REG_ATE_MAX_SEQ
+ * ACK_WIN_SEL: which set of ACK/WINDOW regs to use. This is used for
+ *            atomically updating state.
+ */
+enum
+{
+    REG_ATE_CTL_ENABLE          = (1 << 0),
+    REG_ATE_CTL_CHECK_MAX_SEQ   = (1 << 1),
+    REG_ATE_CTL_ACK_WIN_SEL     = (1 << 2),
+};
+
+/**
+ * \brief 0x40000-0x7ffff: ATE registers
+ *
+ * These registers configure the ExaNIC Accelerated TCP Engines
+ * to control hardware-accelerated TCP sessions
+ */
+enum
+{
+    REG_ATE_BASE            = 0x40000,
+
+    /**
+     * [RW] First four bytes of the destination MAC address
+     */
+    REG_ATE_DMAC_HI         = 0,
+
+    /**
+     * [RW] Last two bytes of the destination MAC address
+     *      and first two bytes of the source MAC address
+     */
+    REG_ATE_DMAC_HI_SMAC_LO = 4,
+
+    /**
+     * [RW] Last four bytes of the source MAC address
+     */
+    REG_ATE_SMAC_LO         = 8,
+
+    /**
+     * [RW] Partial checksum of TCP and IP static fields written
+     *      to the FPGA before connection establishment
+     */
+    REG_ATE_PART_CSUM       = 12,
+
+    /**
+     * [RW] Source IP address of this connection
+     */
+    REG_ATE_SRC_IP          = 16,
+
+    /**
+     * [RW] Destination IP address of this connection
+     */
+    REG_ATE_DST_IP          = 20,
+
+    /**
+     * [RW] Source and Destination TCP ports
+     */
+    REG_ATE_SRC_DST_PORT    = 24,
+
+    /**
+     * [RW] Send sequence number of the next packet
+     */
+    REG_ATE_SEQ             = 28,
+
+    /**
+     * [RW] ACK sequence number of the next packet
+     *      selected when REG_ATE_CTL_ACK_WIN_SEL is set to 0
+     */
+    REG_ATE_ACK             = 32,
+
+    /**
+     * [RW] Receive window value of the next packet
+     *      selected when REG_ATE_CTL_ACK_WIN_SEL is set to 0
+     */
+    REG_ATE_WINDOW          = 36,
+
+    /**
+     * [RW] ACK sequence number of the next packet
+     *      selected when REG_ATE_CTL_ACK_WIN_SEL is set to 1
+     */
+    REG_ATE_ACK_2           = 40,
+
+    /**
+     * [RW] Receive window value of the next packet
+     *      selected when REG_ATE_CTL_ACK_WIN_SEL is set to 1
+     */
+    REG_ATE_WINDOW_2        = 44,
+
+    /**
+     * [RW] Control register
+     */
+    REG_ATE_CTL             = 48,
+
+    /**
+     * [RW] Maximum sequence number ATE is allowed to send
+     *      the check is disabled when REG_ATE_CTL_CHECK_MAX_SEQ
+     *      is set to 0
+     */
+    REG_ATE_MAX_SEQ         = 52,
+};
+
+#define REG_ATE_CONN_ID_OFFSET      6
+#define REG_ATE_PORT_OFFSET         15
+
+#define REG_ATE_OFFSET(port, ate_id, whichreg)                  \
+        (REG_ATE_BASE + (((port) << REG_ATE_PORT_OFFSET)|       \
+                         ((ate_id) << REG_ATE_CONN_ID_OFFSET)|  \
+                          (whichreg)))
+
 /**
  * \brief 0x0400-0x04FF: Port-specific statistics
  *
@@ -727,6 +941,7 @@ enum
 enum
 {
     REG_PORT_STAT_BASE                  = 0x0400,
+    REG_PORT_STAT_BASE_UPPER            = 0x1400,
 
     /**
      * [WO] Reset counters.
@@ -759,7 +974,11 @@ enum
     REG_PORT_STAT_RX_DROPPED            = 5,
 };
 #define REG_PORT_STAT_OFFSET(port, reg) \
-    (REG_PORT_STAT_BASE + (0x10 * (port) + (reg)) * sizeof(uint32_t))
+    (port >= 8 ? \
+        (REG_PORT_STAT_BASE_UPPER + \
+            (0x10 * (port-8) + (reg)) * sizeof(uint32_t)):\
+        (REG_PORT_STAT_BASE + \
+            (0x10 * (port) + (reg)) * sizeof(uint32_t)))
 #define REG_PORT_STAT_INDEX(port, reg) \
     (REG_PORT_STAT_OFFSET(port, reg) / sizeof(uint32_t))
 
@@ -946,15 +1165,16 @@ enum
  */
 typedef enum
 {
-    EXANIC_HW_Z1            = 0, /**< Z1 */
-    EXANIC_HW_Z10           = 1, /**< Z10 */
-    EXANIC_HW_X4            = 2, /**< ExaNIC X4 */
-    EXANIC_HW_X2            = 3, /**< ExaNIC X2 */
-    EXANIC_HW_X10           = 4, /**< ExaNIC X10 */
-    EXANIC_HW_X10_GM        = 5, /**< ExaNIC X10-GM */
-    EXANIC_HW_X40           = 6, /**< ExaNIC X40 */
-    EXANIC_HW_X10_HPT       = 7, /**< ExaNIC X10-HPT */
-    EXANIC_HW_V5P           = 8, /**< ExaNIC V5P */
+    EXANIC_HW_X4            = 2,  /**< ExaNIC X4 */
+    EXANIC_HW_X2            = 3,  /**< ExaNIC X2 */
+    EXANIC_HW_X10           = 4,  /**< ExaNIC X10 */
+    EXANIC_HW_X10_GM        = 5,  /**< ExaNIC X10-GM */
+    EXANIC_HW_X40           = 6,  /**< ExaNIC X40 */
+    EXANIC_HW_X10_HPT       = 7,  /**< ExaNIC X10-HPT */
+    EXANIC_HW_V5P           = 8,  /**< ExaNIC V5P */
+    EXANIC_HW_X25           = 9,  /**< ExaNIC X25 */
+    EXANIC_HW_X100          = 10, /**< ExaNIC X100 */
+    EXANIC_HW_V9P           = 11, /**< ExaNIC V9P */
 } exanic_hardware_id_t;
 
 /**
@@ -970,10 +1190,6 @@ static inline const char * exanic_hardware_id_str(exanic_hardware_id_t id)
 {
     switch (id)
     {
-        case EXANIC_HW_Z1:
-            return "Z1";
-        case EXANIC_HW_Z10:
-            return "Z10";
         case EXANIC_HW_X4:
             return "ExaNIC X4";
         case EXANIC_HW_X2:
@@ -988,6 +1204,12 @@ static inline const char * exanic_hardware_id_str(exanic_hardware_id_t id)
             return "ExaNIC X10-HPT";
         case EXANIC_HW_V5P:
             return "ExaNIC V5P";
+        case EXANIC_HW_X25:
+            return "ExaNIC X25";
+        case EXANIC_HW_X100:
+            return "ExaNIC X100";
+        case EXANIC_HW_V9P:
+            return "ExaNIC V9P";
         default:
             return NULL;
     }
@@ -1041,7 +1263,10 @@ static inline const char * exanic_function_id_str(exanic_function_id_t type)
 typedef enum
 {
     /** Expects a full ethernet frame (without FCS). */
-    EXANIC_TX_TYPE_RAW   = 0x01,
+    EXANIC_TX_TYPE_RAW       = 0x01,
+
+    /** Expects a TCP payload. */
+    EXANIC_TX_TYPE_TCP_ACCEL = 0x02,
 } exanic_tx_type_id_t;
 
 /**
@@ -1060,6 +1285,8 @@ static inline const char * exanic_tx_type_id_str(exanic_tx_type_id_t type_id)
     {
         case EXANIC_TX_TYPE_RAW:
             return "raw";
+        case EXANIC_TX_TYPE_TCP_ACCEL:
+            return "tcp_accel";
         default:
             return NULL;
     }
@@ -1074,22 +1301,30 @@ typedef enum
     EXANIC_CAP_STEER_TWO        = 0x00000002, /**< Two-tuple flow steering */
     EXANIC_CAP_HOT_RELOAD       = 0x00000004, /**< Hot reload supported */
     EXANIC_CAP_JTAG_ACCESS      = 0x00000008, /**< JTAG over PCIe, for ExaNIC FDK */
+    EXANIC_CAP_ATE              = 0x00000010, /**< Accelerated TCP engine */
 
     EXANIC_CAP_HW_TIME_HI       = 0x00000100, /**< 64 bit time counter */
     EXANIC_CAP_CLK_ADJ_EXT      = 0x00000200, /**< Extended clock correction */
+    EXANIC_CAP_LED_ID           = 0x00000400, /**< Supports Identification by LED blinking */
 
     /** Bits which indicate that some kind of RX interrupt is available */
     EXANIC_CAP_RX_IRQ           = EXANIC_CAP_RX_MSI,
 
     EXANIC_CAP_BRIDGING         = 0x00010000, /**< bridging supported */
     EXANIC_CAP_MIRRORING        = 0x00020000, /**< mirroring supported */
+    EXANIC_CAP_DISABLE_TX_PADDING  = 0x00040000, /**< TX frame padding can be disabled */
+    EXANIC_CAP_DISABLE_TX_CRC   = 0x00080000, /**< TX CRCs can be disabled */
 
     EXANIC_CAP_100M             = 0x01000000, /**< 100M supported */
     EXANIC_CAP_1G               = 0x02000000, /**< 1G supported */
     EXANIC_CAP_10G              = 0x04000000, /**< 10G supported */
     EXANIC_CAP_40G              = 0x08000000, /**< 40G supported */
     EXANIC_CAP_100G             = 0x10000000, /**< 100G supported */
+    EXANIC_CAP_25G              = 0x20000000, /**< 25G  supported */
+    EXANIC_CAP_25G_S            = 0x40000000, /**< 25G base-r fec supported */
 } exanic_caps_t;
+
+#define IS_25G_SUPPORTED(caps) ((((caps) & EXANIC_CAP_25G) || ((caps) & EXANIC_CAP_25G_S)) ? (1) : (0))
 
 /**
  * \brief Clock correction control bits
@@ -1181,7 +1416,45 @@ typedef enum
 
     /** Wait until this bit is unset before initialising the card. */
     EXANIC_STATUS_HW_STARTUP    = 0x20000,
+
+    /** Set if this build variant has DDR4 DRAM fitted (X25, X100 only) */
+    EXANIC_STATUS_HW_DRAM_PRES  = 0x40000,
 } exanic_feature_cfg_t;
+
+/**
+ * \brief Opcodes recognized by the QSPI acceleration logic
+ */
+typedef enum
+{
+    /** Start erase sequence */
+    EXANIC_FLASH_QSPI_OPCODE_ERASE  = 0x1,
+    /** Start write sequence */
+    EXANIC_FLASH_QSPI_OPCODE_WRITE  = 0x2,
+    /** Start read sequence */
+    EXANIC_FLASH_QSPI_OPCODE_READ   = 0x4,
+    /** Read device status register */
+    EXANIC_FLASH_QSPI_OPCODE_RDSR   = 0x8,
+    /** Exit quad mode */
+    EXANIC_FLASH_QSPI_QUAD_DISABLE  = 0x10,
+    /** Enter quad mode */
+    EXANIC_FLASH_QSPI_QUAD_ENABLE   = 0x20,
+} exanic_flash_qspi_opcode_t;
+
+/**
+ * \brief Bits in the firmware flash control register
+ */
+typedef enum
+{
+    /**
+     * Parallel NOR flash signals
+     * Availability: all ExaNICs with parallel flash devices
+     */
+    EXANIC_FLASH_CTRL_nWE       = 0x01, /**< active low write enable */
+    EXANIC_FLASH_CTRL_nCE       = 0x02, /**< active low chip enable */
+    EXANIC_FLASH_CTRL_nOE       = 0x04, /**< active low output enable */
+    EXANIC_FLASH_CTRL_nADV      = 0x08, /**< active low address valid */
+    EXANIC_FLASH_CTRL_BUS_DIR   = 0x10, /**< 0 for flash-to-FPGA, 1 for FPGA-to-flash */
+} exanic_flash_ctrl_t;
 
 /**
  * \brief Returns a string representation of a feature bit
@@ -1225,20 +1498,17 @@ typedef enum
     EXANIC_PORT_FLAG_PROMISCUOUS        = 0x01,
 
     /**
-     * For Forwarding device ports 0-2 only.
-     * If enabled, every incoming packet updates the MAC for that port
+     * If enabled BASER-FEC will be forced when autonegotiation is disabled
      */
-    EXANIC_PORT_FLAG_MAC_LEARNING_MODE  = 0x02,
+    EXANIC_PORT_FLAG_FORCE_BASER_FEC    = 0x02,
 
     /**
-     * Auto-neg config codes are sent momentarily when this bit goes from 0-1
-     * Availability: Z1 NIC only
+     * If enabled RS-FEC will be forced when autonegotiation is disabled
      */
-    EXANIC_PORT_FLAG_AUTONEG_TX         = 0x04,
+    EXANIC_PORT_FLAG_FORCE_RS_FEC       = 0x04,
 
     /**
-     * Enable auto-negotiation
-     * Availability: X4, X2
+     * Enable autonegotiation
      */
     EXANIC_PORT_FLAG_AUTONEG_ENABLE     = 0x08,
 
@@ -1247,7 +1517,21 @@ typedef enum
      * Tx to RX of that port
      */
     EXANIC_PORT_FLAG_LOOPBACK           = 0x10,
+
+    /**
+     * If enabled, this port will not automatically pad frames to 60B
+     * on TX
+     */
+    EXANIC_PORT_FLAG_DISABLE_TX_PADDING = 0x20,
+
+    /**
+     * If enabled, this port will not append CRCs to TX frames
+     */
+    EXANIC_PORT_FLAG_DISABLE_TX_CRC     = 0x40
+
 } exanic_port_flags_t;
+
+#define EXANIC_PORT_FLAG_FORCE_FEC_MASK (0x06)
 
 /**
  * \brief DMA address width configuration bits
@@ -1274,58 +1558,53 @@ typedef enum
  * The ExaNIC memory regions are mapped to the user according to the following
  * configuration:
  *
- *            Page Offset 0  +---------------------+
- *                           |      Registers      |
- *                        3  +---------------------+
- *                           |        Info         |
- *                        4  +---------------------+
- *                           |       Filters       |
- *                        8  +---------------------+
- *                           |      TX region      |
- *                       256 +---------------------+
- *                           |     TX feedback     |
- *                       512 +---------------------+
- *                           |  RX region (port0)  |
- *                      1024 +---------------------+
- *                           |  RX region (port1)  |
- *                      1536 +---------------------+
- *                           |  RX region (port2)  |
- *                      2048 +---------------------+
- *                           |  RX region (port3)  |
- *                      2560 +---------------------+
- *                           |    Filter region    |
- *                    262144 +---------------------+
- *                           | Devkit user region  |
- *                    524288 +---------------------+
- *                           | Extended TX region  |
- *                    557056 +---------------------+
- *                           | Extended RX region  |
- *                           +---------------------+
+ *            Page Offset 0  +--------------------------+
+ *                           |         Registers        |
+ *                        3  +--------------------------+
+ *                           |           Info           |
+ *                        4  +--------------------------+
+ *                           |          Filters         |
+ *                        8  +--------------------------+
+ *                           |         TX region        |
+ *                       256 +--------------------------+
+ *                           |        TX feedback       |
+ *                       512 +--------------------------+
+ *                           |     RX region (port0)    |
+ *                      1024 +--------------------------+
+ *                           |     RX region (port1)    |
+ *                      1536 +--------------------------+
+ *                           |     RX region (port2)    |
+ *                      2048 +--------------------------+
+ *                           |     RX region (port3)    |
+ *                      2560 +--------------------------+
+ *                           |       Filter region      |
+ *                    262144 +--------------------------+
+ *                           |    Devkit user region    |
+ *                    524288 +--------------------------+
+ *                           |    Extended TX region    |
+ *                    557056 +--------------------------+
+ *                           |    Extended RX region    |
+ *                   1048576 +--------------------------+
+ *                           |  Extended devkit region  |
+ *                           +--------------------------+
  *
  */
 enum
 {
-    EXANIC_PGOFF_REGISTERS      = 0,
-    EXANIC_PGOFF_INFO           = 3,
-    EXANIC_PGOFF_FILTERS        = 4,
-    EXANIC_PGOFF_TX_REGION      = 8,
-    EXANIC_PGOFF_TX_FEEDBACK    = 256,
-    EXANIC_PGOFF_RX_REGION      = 512,
-    EXANIC_PGOFF_FILTER_REGION  = 2560,
-    EXANIC_PGOFF_DEVKIT_REGS    = 262144,
-    EXANIC_PGOFF_DEVKIT_MEM     = 262148,
-    EXANIC_PGOFF_TX_REGION_EXT  = 524288UL,
-    EXANIC_PGOFF_RX_REGION_EXT  = 557056UL,
-};
-
-/**
- * \brief Z1 GPIO lines
- */
-enum
-{
-    Z1_GPIO_DRV_SDA0        = 0,
-    Z1_GPIO_DRV_SCL0        = 4,
-    Z1_GPIO_SDA0            = 8,
+    EXANIC_PGOFF_REGISTERS          = 0,
+    EXANIC_PGOFF_INFO               = 3,
+    EXANIC_PGOFF_FILTERS            = 4,
+    EXANIC_PGOFF_TX_REGION          = 8,
+    EXANIC_PGOFF_TX_FEEDBACK        = 256,
+    EXANIC_PGOFF_RX_REGION          = 512,
+    EXANIC_PGOFF_FILTER_REGION      = 2560,
+    EXANIC_PGOFF_DEVKIT_REGS        = 262144,
+    EXANIC_PGOFF_DEVKIT_MEM         = 262148,
+    EXANIC_PGOFF_TX_REGION_EXT      = 524288UL,
+    EXANIC_PGOFF_RX_REGION_EXT      = 557056UL,
+    EXANIC_PGOFF_DEVKIT_REGS_EXT    = 1048576UL,
+    /* Leave 256MB of extended register region */
+    EXANIC_PGOFF_DEVKIT_MEM_EXT     = 1114112UL,
 };
 
 /**
@@ -1369,6 +1648,154 @@ enum
     EXANIC_PORT_HASH_FUNCTION_MASK  = 0xF00,
     EXANIC_PORT_HASH_FUNCTION_SHIFT = 8,
 };
+
+/**
+ * \brief EXANIC_PORT_AUTONEG_1 bits
+ */
+typedef enum
+{
+    EXANIC_PORT_AUTONEG_RESTART         = 0x00000001,
+    EXANIC_DISABLE_NONCE_MATCH_CHECK    = 0x00000100
+} exanic_autoneg_control_t;
+
+/**
+ * \brief EXANIC_PORT_AUTONEG_2 bits
+ */
+enum
+{
+    EXANIC_AUTONEG_ABILITY_MASK         = 0x000007FF,
+    EXANIC_AUTONEG_ABILITY_SHIFT        = 0,
+    EXANIC_AUTONEG_FEC_CAPABILITY_MASK  = 0x000F0000,
+    EXANIC_AUTONEG_FEC_CAPABILITY_SHIFT = 16,
+    EXANIC_AUTONEG_TX_NONCE_SEED        = 0x00F00000,
+    EXANIC_AUTONEG_TX_NONCE_SEED_SHIFT  = 20,
+};
+
+#define AUTONEG_CAPS(reg) (((reg) & EXANIC_AUTONEG_ABILITY_MASK) >> EXANIC_AUTONEG_ABILITY_SHIFT)
+
+enum
+{
+    AUTONEG_TECH_ABILITY_1000_BASE_KX   = 0x00000001,
+    AUTONEG_TECH_ABILITY_10G_BASE_KX4   = 0x00000002,
+    AUTONEG_TECH_ABILITY_10G_BASE_KR    = 0x00000004,
+    AUTONEG_TECH_ABILITY_40G_BASE_KR4   = 0x00000008,
+    AUTONEG_TECH_ABILITY_40G_BASE_CR4   = 0x00000010,
+    AUTONEG_TECH_ABILITY_100G_BASE_CR10 = 0x00000020,
+    AUTONEG_TECH_ABILITY_100G_BASE_KP4  = 0x00000040,
+    AUTONEG_TECH_ABILITY_100G_BASE_KR4  = 0x00000080,
+    AUTONEG_TECH_ABILITY_100G_BASE_CR4  = 0x00000100,
+    AUTONEG_TECH_ABILITY_25G_BASE_KR_S  = 0x00000200,
+    AUTONEG_TECH_ABILITY_25G_BASE_KR    = 0x00000400,
+};
+
+enum
+{
+    AUTONEG_TECH_ABILITY_1000_BASE_KX_BIT_NUM   = 0,
+    AUTONEG_TECH_ABILITY_10G_BASE_KX4_BIT_NUM   = 1,
+    AUTONEG_TECH_ABILITY_10G_BASE_KR_BIT_NUM    = 2,
+    AUTONEG_TECH_ABILITY_40G_BASE_KR4_BIT_NUM   = 3,
+    AUTONEG_TECH_ABILITY_40G_BASE_CR4_BIT_NUM   = 4,
+    AUTONEG_TECH_ABILITY_100G_BASE_CR10_BIT_NUM = 5,
+    AUTONEG_TECH_ABILITY_100G_BASE_KP4_BIT_NUM  = 6,
+    AUTONEG_TECH_ABILITY_100G_BASE_KR4_BIT_NUM  = 7,
+    AUTONEG_TECH_ABILITY_100G_BASE_CR4_BIT_NUM  = 8,
+    AUTONEG_TECH_ABILITY_25G_BASE_KR_S_BIT_NUM  = 9,
+    AUTONEG_TECH_ABILITY_25G_BASE_KR_BIT_NUM    = 10,
+    AUTONEG_TECH_ABILITY_END_BIT                = 11
+};
+
+enum
+{
+    FEC_CAPABILITY_RS_FEC = 0x00040000,
+    FEC_CAPABILITY_BASER  = 0x00080000
+};
+
+/**
+ * \brief EXANIC_PORT_AUTONEG_3 bits
+ */
+typedef enum
+{
+    EXANIC_PORT_AUTONEG_FLAGS_LINK_IS_GOOD            = 0x00000001,
+    EXANIC_PORT_AUTONEG_FLAGS_LINK_PARTNER_IS_AUTONEG = 0x00000100,
+    EXANIC_PORT_AUTONEG_FLAGS_RESOLVED_BASER_FEC      = 0x00010000,
+    EXANIC_PORT_AUTONEG_FLAGS_RESOLVED_RS_FEC         = 0x00020000
+} exanic_autoneg_flags_t;
+
+enum
+{
+    EXANIC_AUTONEG_HCD_MASK  = 0x00007000,
+    EXANIC_AUTONEG_HCD_SHIFT = 12
+};
+
+#define AUTONEG_HCD_VALUE(reg) (((reg) & EXANIC_AUTONEG_HCD_MASK) >> EXANIC_AUTONEG_HCD_SHIFT)
+
+enum
+{
+    UNRESOLVED   = 0,
+    PMD_10G_KR   = 1,
+    PMD_40G_CR4  = 2,
+    PMD_25G_CR   = 3,
+    PMD_25G_CR_S = 4,
+};
+/**
+ * \brief EXANIC_PORT_AUTONEG_4 bits
+ */
+enum
+{
+    EXANIC_AUTONEG_LINK_PARTNER_TECH_ABILITY_MASK    = 0x000007FF,
+    EXANIC_AUTONEG_LINK_PARTNER_TECH_ABILITY_BIT_FIELD_SIZE = 11,
+    EXANIC_AUTONEG_LINK_PARTNER_TECH_ABILITY_SHIFT   = 0,
+    EXANIC_AUTONEG_LINK_PARTNER_FEC_CAPABILITY_MASK  = 0x000F0000,
+    EXANIC_AUTONEG_LINK_PARTNER_FEC_CAPABILITY_SHIFT = 16
+};
+
+#define LINK_PARTNER_TECHS(reg) (((reg) & EXANIC_AUTONEG_LINK_PARTNER_TECH_ABILITY_MASK) >> EXANIC_AUTONEG_LINK_PARTNER_TECH_ABILITY_SHIFT)
+
+typedef enum
+{
+    TECH_ABILITY_1000BASE_KX,
+    TECH_ABILITY_10GBASE_KX4,
+    TECH_ABILITY_10GBASE_KR,
+    TECH_ABILITY_40GBASE_KR4,
+    TECH_ABILITY_40GBASE_CR4,
+    TECH_ABILITY_100GBASE_CR10,
+    TECH_ABILITY_100GBASE_KP4,
+    TECH_ABILITY_100GBASE_KR4,
+    TECH_ABILITY_100GBASE_CR4,
+    TECH_ABILITY_25GBASE_KR_S,
+    TECH_ABILITY_25GBASE_KR,
+} exa_link_partner_ability_t;
+
+/**
+ * \brief EXANIC_PORT_AUTONEG_6 bits
+ */
+enum
+{
+    EXANIC_AUTONEG_ARBITER_STATE_MASK  = 0x0000000F,
+    EXANIC_AUTONEG_ARBITER_STATE_SHIFT = 0
+};
+
+#define AUTONEG_ARBITER_STATE(reg) (((reg) & EXANIC_AUTONEG_ARBITER_STATE_MASK) >> EXANIC_AUTONEG_ARBITER_STATE_SHIFT)
+
+typedef enum
+{
+    EXANIC_PORT_ARBITER_AUTONEG_ENABLE              = 0,
+    EXANIC_PORT_ARBITER_TRANSMIT_ENABLE             = 1,
+    EXANIC_PORT_ARBITER_ABILITY_DETECT              = 2,
+    EXANIC_PORT_ARBITER_ACK_DETECT                  = 3,
+    EXANIC_PORT_ARBITER_COMPLETE_ACK                = 4,
+    EXANIC_PORT_ARBITER_NEXT_PAGE_WAIT              = 5,
+    EXANIC_PORT_ARBITER_AN_GOOD_CHECK               = 6,
+    EXANIC_PORT_ARBITER_AN_GOOD                     = 7,
+    EXANIC_PORT_ARBITER_LINK_STATUS_CHECK           = 8,
+    EXANIC_PORT_ARBITER_PARALLEL_DETECTION_FAULT    = 9,
+    EXANIC_PORT_ARBITER_END                         = 10
+} exanic_port_autoneg_arbiter_state_t;
+
+#define EXANIC_SUPPORTED_FECS(caps) (caps & EXANIC_CAP_25G) ? (FEC_CAPABILITY_BASER | FEC_CAPABILITY_RS_FEC) : ((caps | EXANIC_CAP_25G_S) ? (FEC_CAPABILITY_BASER) : (0))
+#define EXANIC_SUPPORTED_ETHTOOL_FECS(caps) (caps & EXANIC_CAP_25G) ? (ETHTOOL_FEC_BASER | ETHTOOL_FEC_RS) : ((caps & EXANIC_CAP_25G_S) ? (ETHTOOL_FEC_BASER) : (0))
+#define EXANIC_25G_AUTONEG_SUPPORTED_TECHS (AUTONEG_TECH_ABILITY_10G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR_S)
+#define EXANIC_25G_S_AUTONEG_SUPPORTED_TECHS (AUTONEG_TECH_ABILITY_10G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR_S)
 
 /**
  * \brief Hash function identifiers.
@@ -1433,6 +1860,8 @@ enum
 
     EXANIC_PTP_CONF1_PTP_PROFILE_MASK           = 0x000F0000,
     EXANIC_PTP_CONF1_PTP_PROFILE_SHIFT          = 16,
+
+    EXANIC_PTP_CONF1_PTP_TWO_STEP_EN            = 0x00100000,
 
     EXANIC_PTP_CONF1_PPS_OUT_EN                 = 0x10000000,
     EXANIC_PTP_CONF1_PPS_OUT_VAL                = 0x20000000,

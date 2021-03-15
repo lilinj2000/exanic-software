@@ -14,11 +14,15 @@
 #include <linux/miscdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/net_tstamp.h>
+#ifndef NETIF_F_IP_CSUM
+#include <linux/netdev_features.h>
+#endif
 
 #include "../../libs/exanic/pcie_if.h"
 #include "../../libs/exanic/fifo_if.h"
 #include "../../libs/exanic/ioctl.h"
 #include "exanic.h"
+#include "exanic-i2c.h"
 #include "exanic-structs.h"
 
 /**
@@ -54,25 +58,6 @@ MODULE_PARM_DESC(txbuf_size_min,
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 32)
 #define netdev_tx_t int
-#endif
-
-#ifndef SUPPORTED_1000baseKX_Full
-#define SUPPORTED_1000baseKX_Full	(1 << 17)
-#endif
-#ifndef SUPPORTED_10000baseKR_Full
-#define SUPPORTED_10000baseKR_Full	(1 << 19)
-#endif
-#ifndef SUPPORTED_40000baseCR4_Full
-#define SUPPORTED_40000baseCR4_Full	(1 << 24)
-#endif
-#ifndef SUPPORTED_40000baseSR4_Full
-#define SUPPORTED_40000baseSR4_Full	(1 << 25)
-#endif
-#ifndef SUPPORTED_40000baseLR4_Full
-#define SUPPORTED_40000baseLR4_Full	(1 << 26)
-#endif
-#ifndef SPEED_40000
-#define SPEED_40000 40000
 #endif
 
 #ifndef SIOCGHWTSTAMP
@@ -164,23 +149,162 @@ enum
     EXANIC_RX_FRAME_TRUNCATED = 257,
 };
 
+void exanic_netdev_get_id_and_port(struct net_device *ndev,
+                                   int *id, int *port_num)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    *id = priv->exanic->id;
+    *port_num = priv->port;
+}
+EXPORT_SYMBOL(exanic_netdev_get_id_and_port);
+
+static int exanic_transmit_payload(struct exanic_netdev_tx *tx,
+                                   int connection_id, const char *payload,
+                                   size_t payload_size);
+
+int exanic_netdev_ate_acquire(struct net_device *ndev, int ate_id)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    return exanic_ate_acquire(priv->exanic, priv->port, ate_id);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_acquire);
+
+void exanic_netdev_ate_release(struct net_device *ndev, int ate_id)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    exanic_ate_release(priv->exanic, priv->port, ate_id);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_release);
+
+void exanic_netdev_ate_disable(struct net_device *ndev, int ate_id)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    exanic_ate_disable(priv->exanic, priv->port, ate_id);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_disable);
+
+int exanic_netdev_ate_init(struct net_device *ndev, int ate_id,
+                           struct exanic_ate_cfg *cfg)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    return exanic_ate_init(priv->exanic, priv->port, ate_id, cfg);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_init);
+
+int exanic_netdev_ate_update(struct net_device *ndev, int ate_id,
+                             struct exanic_ate_update *cfg)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    return exanic_ate_update(priv->exanic, priv->port, ate_id, cfg);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_update);
+
+uint32_t exanic_netdev_ate_read_seq(struct net_device *ndev, int ate_id)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    return exanic_ate_read_seq(priv->exanic, priv->port, ate_id);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_read_seq);
+
+int exanic_netdev_ate_send_ctrl(struct net_device *ndev, int ate_id)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+
+    return exanic_transmit_payload(&priv->tx, ate_id, "\0", 0);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_send_ctrl);
+
+void exanic_netdev_ate_regdump(struct net_device *ndev, int ate_id,
+                               struct exanic_ate_regdump *cfg)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    exanic_ate_regdump(priv->exanic, priv->port, ate_id, cfg);
+}
+EXPORT_SYMBOL(exanic_netdev_ate_regdump);
+
 static void exanic_rx_catchup(struct exanic_netdev_rx *rx)
 {
-    /* Find the next chunk in which data will arrive */
-    uint8_t generation = rx->buffer[0].u.info.generation;
-    uint32_t next_chunk;
-    for (next_chunk = 1; next_chunk < EXANIC_RX_NUM_CHUNKS; next_chunk++)
-        if (rx->buffer[next_chunk].u.info.generation != generation)
-            break;
-    if (next_chunk < EXANIC_RX_NUM_CHUNKS)
+    /* Find the most recent end-of-frame chunk in the RX region,
+     * and move next_chunk pointer to the next chunk after it
+     *
+     * If no end-of-frame or uninitialized chunks are encountered
+     * (shouldn't happen), then move next_chunk pointer to where
+     * the generation number changes */
+    uint8_t eof_gen = 0, break_gen = 0;
+    uint32_t eof_chunk = 0, break_chunk = 0, chunk;
+    bool eof_found = false, before_break = false;
+    union {
+        struct rx_chunk_info info;
+        uint64_t data;
+    } u;
+
+    /* Iterate backwards through RX region */
+    for (chunk = EXANIC_RX_NUM_CHUNKS; chunk-- > 0; )
     {
-        rx->generation = generation;
-        rx->next_chunk = next_chunk;
+        u.data = rx->buffer[chunk].u.data;
+
+        if (chunk == EXANIC_RX_NUM_CHUNKS - 1)
+        {
+            /* Starting value assumes break is at the wrap-around */
+            break_gen = u.info.generation;
+            break_chunk = EXANIC_RX_NUM_CHUNKS - 1;
+        }
+        else if (u.info.generation != break_gen)
+        {
+            /* Found break in generation number */
+            before_break = true;
+            break_gen = u.info.generation;
+            break_chunk = chunk;
+        }
+
+        /* Length field is non-zero for both end-of-frame chunks and
+         * uninitialized chunks */
+        if (u.info.length != 0)
+        {
+            if (before_break)
+            {
+                /* Found an end-of-frame before the break
+                 * This is the most recent end-of-frame */
+                eof_found = true;
+                eof_gen = u.info.generation;
+                eof_chunk = chunk;
+                break;
+            }
+            else if (!eof_found)
+            {
+                /* Found the final end-of-frame before the wrap-around
+                 * If there are no end-of-frames before the break, then
+                 * this is the most recent end-of-frame */
+                eof_found = true;
+                eof_gen = u.info.generation;
+                eof_chunk = chunk;
+            }
+        }
+    }
+
+    if (eof_found)
+    {
+        /* Set next_chunk to the chunk after the most recent end-of-frame */
+        rx->next_chunk = eof_chunk + 1;
+        rx->generation = eof_gen;
     }
     else
     {
-        rx->generation = generation + 1;
+        /* Set next_chunk to where generation number changes */
+        rx->next_chunk = break_chunk + 1;
+        rx->generation = break_gen;
+    }
+
+    if (rx->next_chunk == EXANIC_RX_NUM_CHUNKS)
+    {
         rx->next_chunk = 0;
+        rx->generation++;
     }
 }
 
@@ -211,7 +335,9 @@ static void exanic_rx_set_irq(struct exanic_netdev_rx *rx)
 static ssize_t exanic_receive_chunk_inplace(struct exanic_netdev_rx *rx,
                                             char **rx_buf_ptr,
                                             uint32_t *chunk_id,
-                                            int *more_chunks)
+                                            uint8_t *matched_filter,
+                                            uint16_t *chunk_status,
+                                            bool *more_chunks)
 {
     union {
         struct rx_chunk_info info;
@@ -219,6 +345,7 @@ static ssize_t exanic_receive_chunk_inplace(struct exanic_netdev_rx *rx,
     } u;
 
     u.data = rx->buffer[rx->next_chunk].u.data;
+    *chunk_status = u.info.frame_status & EXANIC_RX_FRAME_ERROR_MASK;
 
     if (u.info.generation == rx->generation)
     {
@@ -227,6 +354,9 @@ static ssize_t exanic_receive_chunk_inplace(struct exanic_netdev_rx *rx,
 
         if (chunk_id != NULL)
             *chunk_id = rx->generation * EXANIC_RX_NUM_CHUNKS + rx->next_chunk;
+
+        if (matched_filter != NULL)
+            *matched_filter = u.info.matched_filter;
 
         /* Advance next_chunk to next chunk */
         rx->next_chunk++;
@@ -239,16 +369,13 @@ static ssize_t exanic_receive_chunk_inplace(struct exanic_netdev_rx *rx,
         if (u.info.length != 0)
         {
             /* Last chunk */
-            if (u.info.frame_status & EXANIC_RX_FRAME_ERROR_MASK)
-                return -(u.info.frame_status & EXANIC_RX_FRAME_ERROR_MASK);
-
-            *more_chunks = 0;
+            *more_chunks = false;
             return u.info.length;
         }
         else
         {
             /* More chunks to come */
-            *more_chunks = 1;
+            *more_chunks = true;
             return EXANIC_RX_CHUNK_PAYLOAD_SIZE;
         }
     }
@@ -261,7 +388,8 @@ static ssize_t exanic_receive_chunk_inplace(struct exanic_netdev_rx *rx,
     {
         /* Got lapped? */
         exanic_rx_catchup(rx);
-        return -EXANIC_RX_FRAME_SWOVFL;
+        *chunk_status = EXANIC_RX_FRAME_SWOVFL;
+        return -1;
     }
 }
 
@@ -441,8 +569,8 @@ static void exanic_send_tx_chunk(struct exanic_netdev_tx *tx, size_t chunk_size)
     tx->next_seq++;
 }
 
-static int __exanic_transmit_frame(struct exanic_netdev_tx *tx,
-                                   struct sk_buff *skb)
+static int exanic_transmit_frame(struct exanic_netdev_tx *tx,
+                                 struct sk_buff *skb)
 {
     size_t padding = exanic_payload_padding_bytes(EXANIC_TX_TYPE_RAW);
     size_t chunk_size = skb->len + padding + sizeof(struct tx_chunk);
@@ -460,6 +588,37 @@ static int __exanic_transmit_frame(struct exanic_netdev_tx *tx,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 36)
     skb_tx_timestamp(skb);
 #endif
+
+    exanic_send_tx_chunk(tx, chunk_size);
+    return 0;
+}
+
+static int exanic_transmit_payload(struct exanic_netdev_tx* tx,
+                                   int connection_id, const char *payload,
+                                   size_t payload_size)
+{
+    size_t padding = exanic_payload_padding_bytes(EXANIC_TX_TYPE_TCP_ACCEL);
+    size_t length = padding + sizeof(struct tx_payload_metadata) + payload_size;
+    size_t chunk_size = sizeof(struct tx_chunk) + length;
+    struct tx_payload_metadata payload_metadata;
+    struct tx_chunk *chunk;
+    char *payload_ptr;
+
+    chunk = exanic_prepare_tx_chunk(tx, chunk_size);
+    if (chunk == NULL)
+        return -1;
+
+    writew(length, &chunk->length);
+    writeb(EXANIC_TX_TYPE_TCP_ACCEL, &chunk->type);
+    payload_metadata.csum = 0;
+    payload_metadata.connection_id = connection_id;
+    payload_ptr = chunk->payload + padding;
+    memcpy_toio(payload_ptr, &payload_metadata, sizeof(struct tx_payload_metadata));
+    if (payload_size)
+    {
+        payload_ptr += sizeof(struct tx_payload_metadata);
+        memcpy_toio(payload_ptr, payload, payload_size);
+    }
 
     exanic_send_tx_chunk(tx, chunk_size);
     return 0;
@@ -625,11 +784,10 @@ static void exanic_netdev_kernel_stop(struct net_device *ndev)
     /* This flag stops the timer as well as the irq handler */
     priv->rx_enabled = false;
 
-    /* Wait a little to make sure irq handler has stopped running
-     * TODO: Should this use a spinlock instead? */
-    udelay(10);
-
-    if (!(priv->exanic->caps & EXANIC_CAP_RX_IRQ))
+    /* Make sure the irq handler or timer has stopped running */
+    if (priv->exanic->caps & EXANIC_CAP_RX_IRQ)
+        synchronize_irq(priv->exanic->pci_dev->irq);
+    else
         del_timer_sync(&priv->rx_timer);
 
     hrtimer_cancel(&priv->rx_hrtimer);
@@ -802,7 +960,7 @@ static netdev_tx_t exanic_netdev_xmit(struct sk_buff *skb,
         return NETDEV_TX_OK;
     }
 
-    err = __exanic_transmit_frame(&priv->tx, skb);
+    err = exanic_transmit_frame(&priv->tx, skb);
 
     spin_unlock_irqrestore(&priv->tx_lock, flags);
 
@@ -905,6 +1063,14 @@ static int exanic_netdev_change_mtu(struct net_device *ndev, int new_mtu)
     return 0;
 }
 
+#ifdef NETIF_F_RXALL
+int exanic_set_features(struct net_device *netdev, netdev_features_t features)
+{
+    netdev->features = features;
+    return 0;
+}
+#endif
+
 /**
  * Handle ioctl request on a ExaNIC interface.
  */
@@ -1005,109 +1171,87 @@ int exanic_netdev_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
 }
 
 static struct net_device_ops exanic_ndos = {
-    .ndo_open               = exanic_netdev_open,
-    .ndo_stop               = exanic_netdev_stop,
-    .ndo_start_xmit         = exanic_netdev_xmit,
-    .ndo_set_rx_mode        = exanic_netdev_set_rx_mode,
-    .ndo_set_mac_address    = exanic_netdev_set_mac_addr,
-    .ndo_change_mtu         = exanic_netdev_change_mtu,
-    .ndo_do_ioctl           = exanic_netdev_ioctl,
+    .ndo_open                = exanic_netdev_open,
+    .ndo_stop                = exanic_netdev_stop,
+    .ndo_start_xmit          = exanic_netdev_xmit,
+    .ndo_set_rx_mode         = exanic_netdev_set_rx_mode,
+    .ndo_set_mac_address     = exanic_netdev_set_mac_addr,
+    .ndo_do_ioctl            = exanic_netdev_ioctl,
+
+#if __USE_RH_NETDEV_CHANGE_MTU
+    .ndo_change_mtu_rh74     = exanic_netdev_change_mtu,
+#else
+    .ndo_change_mtu          = exanic_netdev_change_mtu,
+#endif
+
+#ifdef NETIF_F_RXALL
+    .ndo_set_features        = exanic_set_features,
+#endif
+
 };
 
+#ifdef ETHTOOL_GLINKSETTINGS
+static int exanic_netdev_get_link_ksettings(struct net_device *ndev,
+                                            struct ethtool_link_ksettings *settings)
+#else /* ETHTOOL_GLINKSETTINGS */
 static int exanic_netdev_get_settings(struct net_device *ndev,
-                                      struct ethtool_cmd *cmd)
+                                      struct ethtool_cmd *settings)
+#endif /* ETHTOOL_GLINKSETTINGS */
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
-    uint32_t reg;
-
-    reg = readl(&priv->registers[REG_EXANIC_INDEX(REG_EXANIC_CAPS)]);
-    cmd->supported = SUPPORTED_FIBRE;
-    if (reg & EXANIC_CAP_100M)
-        cmd->supported |= SUPPORTED_100baseT_Full | SUPPORTED_Autoneg;
-    if (reg & EXANIC_CAP_1G)
-        cmd->supported |= SUPPORTED_1000baseT_Full | SUPPORTED_1000baseKX_Full | SUPPORTED_Autoneg;
-    if (reg & EXANIC_CAP_10G)
-        cmd->supported |= SUPPORTED_10000baseKR_Full;
-    if (reg & EXANIC_CAP_40G)
-         cmd->supported |= SUPPORTED_40000baseCR4_Full |
-                           SUPPORTED_40000baseSR4_Full |
-                           SUPPORTED_40000baseLR4_Full;
-
-    reg = readl(&priv->registers[REG_PORT_INDEX(priv->port, REG_PORT_SPEED)]);
-    ethtool_cmd_speed_set(cmd, reg);
-
-    cmd->duplex = DUPLEX_FULL;
-    cmd->port = PORT_FIBRE;
-    cmd->transceiver = XCVR_INTERNAL;
-
-    reg = readl(&priv->registers[REG_PORT_INDEX(priv->port, REG_PORT_FLAGS)]);
-    if (reg & EXANIC_PORT_FLAG_AUTONEG_ENABLE)
-        cmd->autoneg = AUTONEG_ENABLE;
-    else
-        cmd->autoneg = AUTONEG_DISABLE;
-
-    return 0;
+    struct exanic *exanic = priv->exanic;
+    int port_no = priv->port;
+    
+    return exanic_phyops_get_configs(exanic, port_no, settings);
 }
 
+#ifdef ETHTOOL_GLINKSETTINGS
+static int exanic_netdev_set_link_ksettings(struct net_device *ndev,
+                                            const struct ethtool_link_ksettings *settings)
+#else /* ETHTOOL_GLINKSETTINGS */
 static int exanic_netdev_set_settings(struct net_device *ndev,
-                                      struct ethtool_cmd *cmd)
+                                      struct ethtool_cmd *settings)
+#endif /* ETHTOOL_GLINKSETTINGS */
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
-    uint32_t reg, speed, caps;
+    struct exanic *exanic = priv->exanic;
+    int port_no = priv->port;
+    struct mutex *mutex = exanic_mutex(priv->exanic);
+    int ret;
+    
+    mutex_lock(mutex);
+    ret = exanic_phyops_set_configs(exanic, port_no, settings);
+    mutex_unlock(mutex);
 
-    caps = readl(&priv->registers[REG_EXANIC_INDEX(REG_EXANIC_CAPS)]);
+    return ret;
+}
 
-    speed = ethtool_cmd_speed(cmd);
-    reg = readl(&priv->registers[REG_PORT_INDEX(priv->port, REG_PORT_SPEED)]);
-    if (speed != reg)
-    {
-        if ((speed == SPEED_100 && (caps & EXANIC_CAP_100M)) ||
-            (speed == SPEED_1000 && (caps & EXANIC_CAP_1G)) ||
-            (speed == SPEED_10000 && (caps & EXANIC_CAP_10G)) ||
-            (speed == SPEED_40000 && (caps & EXANIC_CAP_40G)))
-        {
-            /* Card specific updates */
-            if (priv->exanic->hw_id == EXANIC_HW_X4 ||
-                    priv->exanic->hw_id == EXANIC_HW_X2 ||
-                        priv->exanic->hw_id == EXANIC_HW_X10 ||
-                            priv->exanic->hw_id == EXANIC_HW_X10_GM ||
-                            priv->exanic->hw_id == EXANIC_HW_X40 ||
-                            priv->exanic->hw_id == EXANIC_HW_V5P)
-            {
-                if (exanic_x4_x2_set_speed(priv->exanic, priv->port, reg, speed))
-                    return -EINVAL;
-                exanic_x4_x2_save_speed(priv->exanic, priv->port, speed);
-            }
+#ifdef ETHTOOL_SFECPARAM
+static int exanic_netdev_set_fecparam(struct net_device *ndev, struct ethtool_fecparam *fp)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct exanic *exanic = priv->exanic;
+    int port_no = priv->port;
+    struct mutex *mutex = exanic_mutex(priv->exanic);
+    int ret;
 
-            /* Change port speed, even if the port is up */
-            writel(speed, &priv->registers[REG_PORT_INDEX(priv->port,
-                        REG_PORT_SPEED)]);
-        }
-        else
-        {
-            /* Invalid speed */
-            return -EINVAL;
-        }
-    }
-
-    reg = readl(&priv->registers[REG_PORT_INDEX(priv->port, REG_PORT_FLAGS)]);
-    if (cmd->autoneg == AUTONEG_ENABLE)
-        reg |= EXANIC_PORT_FLAG_AUTONEG_ENABLE;
-    else
-        reg &= ~EXANIC_PORT_FLAG_AUTONEG_ENABLE;
-    writel(reg, &priv->registers[REG_PORT_INDEX(priv->port, REG_PORT_FLAGS)]);
-
-    if (priv->exanic->hw_id == EXANIC_HW_X4 ||
-            priv->exanic->hw_id == EXANIC_HW_X2 ||
-                priv->exanic->hw_id == EXANIC_HW_X10 ||
-                    priv->exanic->hw_id == EXANIC_HW_X10_GM ||
-                    priv->exanic->hw_id == EXANIC_HW_X40 ||
-                    priv->exanic->hw_id == EXANIC_HW_V5P)
-        exanic_x4_x2_save_autoneg(priv->exanic, priv->port,
-                                  cmd->autoneg == AUTONEG_ENABLE);
+    mutex_lock(mutex);
+    ret = exanic_phyops_set_fecparam(exanic, port_no, fp);
+    mutex_unlock(mutex);
 
     return 0;
 }
+
+static int exanic_netdev_get_fecparam(struct net_device *ndev, struct ethtool_fecparam *fp)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct exanic *exanic = priv->exanic;
+    int port_no = priv->port;
+
+    return exanic_phyops_get_fecparam(exanic, port_no, fp);
+}
+
+#endif /* ETHTOOL_SFECPARAM */
 
 static void exanic_netdev_get_drvinfo(struct net_device *ndev,
                                       struct ethtool_drvinfo *info)
@@ -1120,10 +1264,12 @@ static void exanic_netdev_get_drvinfo(struct net_device *ndev,
 static u32 exanic_netdev_get_link(struct net_device *ndev)
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
-    uint32_t reg;
+    struct exanic *exanic = priv->exanic;
+    int port_no = priv->port;
+    uint32_t link_status = false;
 
-    reg = readl(&priv->registers[REG_PORT_INDEX(priv->port, REG_PORT_STATUS)]);
-    return !!(reg & EXANIC_PORT_STATUS_LINK);
+    exanic_phyops_get_link_status(exanic, port_no, &link_status);
+    return link_status;
 }
 
 /* Definitions for ethtool priv flags interface */
@@ -1302,9 +1448,107 @@ static int exanic_netdev_get_ts_info(struct net_device *ndev,
 }
 #endif
 
+#ifdef ETHTOOL_GMODULEINFO
+
+static int
+exanic_netdev_get_module_info(struct net_device *ndev,
+                              struct ethtool_modinfo *minfo)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct mutex *mutex = exanic_mutex(priv->exanic);
+    int ret;
+
+    mutex_lock(mutex);
+    ret = exanic_phyops_get_module_info(priv->exanic, priv->port,
+                                        minfo);
+    mutex_unlock(mutex);
+
+    return ret;
+}
+
+static int exanic_netdev_get_module_eeprom(struct net_device *ndev,
+                                    struct ethtool_eeprom *eeep, u8 *data)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    return exanic_phyops_get_module_eeprom(priv->exanic, priv->port,
+                                           eeep, data);
+}
+
+#endif /* ETHTOOL_GMODULEINFO */
+
+#ifdef ETHTOOL_PHYS_ID
+
+static int exanic_netdev_set_phys_id(struct net_device *ndev,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0) || __RH_ETHTOOL_OPS_EXT
+                                     enum ethtool_phys_id_state state)
+#else
+                                     uint32_t phys_id_time)
+#endif
+{
+    struct exanic *exanic;
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    uint32_t seconds;
+
+    exanic = priv->exanic;
+    if ((exanic->caps & EXANIC_CAP_LED_ID) == 0)
+        return -EOPNOTSUPP;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0) || __RH_ETHTOOL_OPS_EXT
+    if (state == ETHTOOL_ID_ACTIVE || state == ETHTOOL_ID_ON)
+        seconds = 0xffffffff;
+    else
+        seconds = 0;
+#else
+    seconds = phys_id_time;
+#endif
+
+    writel(seconds, exanic->regs_virt +
+                    REG_EXANIC_OFFSET(REG_EXANIC_IDENTIFY_TIMER));
+    return 0;
+}
+
+#endif /* ETHTOOL_PHYS_ID */
+
+static int exanic_netdev_get_eeprom_len(struct net_device *ndev)
+{
+    return EXANIC_EEPROM_SIZE;
+}
+
+static int exanic_netdev_get_eeprom(struct net_device *ndev,
+                                    struct ethtool_eeprom *eeprom, u8 *bytes)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct exanic *exanic = priv->exanic;
+    uint8_t offset = eeprom->offset;
+    size_t len = eeprom->len;
+
+    if (eeprom->len == 0)
+        return -EINVAL;
+
+    eeprom->magic = exanic->pci_dev->vendor | (exanic->pci_dev->device << 16);
+
+    return exanic_i2c_eeprom_read(priv->exanic, offset, bytes, len);
+}
+
+static int exanic_netdev_set_eeprom(struct net_device *ndev,
+                                    struct ethtool_eeprom *eeprom, u8 *bytes)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct exanic *exanic = priv->exanic;
+    uint8_t offset = eeprom->offset;
+    size_t len = eeprom->len;
+
+    if (eeprom->len == 0)
+        return -EINVAL;
+
+    if (eeprom->magic !=
+        (exanic->pci_dev->vendor | (exanic->pci_dev->device << 16)))
+        return -EINVAL;
+
+    return exanic_i2c_eeprom_write(priv->exanic, offset, bytes, len);
+}
+
 static struct ethtool_ops exanic_ethtool_ops = {
-    .get_settings           = exanic_netdev_get_settings,
-    .set_settings           = exanic_netdev_set_settings,
     .get_drvinfo            = exanic_netdev_get_drvinfo,
     .get_link               = exanic_netdev_get_link,
     .get_strings            = exanic_netdev_get_strings,
@@ -1313,16 +1557,58 @@ static struct ethtool_ops exanic_ethtool_ops = {
     .get_sset_count         = exanic_netdev_get_sset_count,
     .get_coalesce           = exanic_netdev_get_coalesce,
     .set_coalesce           = exanic_netdev_set_coalesce,
-#if defined(ETHTOOL_GET_TS_INFO) && LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0)
+#ifdef ETHTOOL_COALESCE_RX_USECS
+    .supported_coalesce_params = ETHTOOL_COALESCE_RX_USECS,
+#endif
+
+#if defined(ETHTOOL_GMODULEINFO) && ! __RH_ETHTOOL_OPS_EXT
+    .get_module_info        = exanic_netdev_get_module_info,
+    .get_module_eeprom      = exanic_netdev_get_module_eeprom,
+#endif
+#if defined(ETHTOOL_GET_TS_INFO) && ! __RH_ETHTOOL_OPS_EXT
     .get_ts_info            = exanic_netdev_get_ts_info,
 #endif
+
+#ifdef ETHTOOL_GLINKSETTINGS
+    .get_link_ksettings     = exanic_netdev_get_link_ksettings,
+    .set_link_ksettings     = exanic_netdev_set_link_ksettings,
+#else /* ETHTOOL_GLINKSETTINGS */
+    .get_settings           = exanic_netdev_get_settings,
+    .set_settings           = exanic_netdev_set_settings,
+#endif /* ETHTOOL_GLINKSETTINGS */
+
+#ifdef ETHTOOL_SFECPARAM
+    .get_fecparam           = exanic_netdev_get_fecparam,
+    .set_fecparam           = exanic_netdev_set_fecparam,
+#endif /* ETHTOOL_SFECPARAM */
+
+#if defined (ETHTOOL_PHYS_ID) && !__RH_ETHTOOL_OPS_EXT
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 0)
+    .set_phys_id            = exanic_netdev_set_phys_id,
+#else
+    .phys_id                = exanic_netdev_set_phys_id,
+#endif
+#endif
+    .get_eeprom_len         = exanic_netdev_get_eeprom_len,
+    .get_eeprom             = exanic_netdev_get_eeprom,
+    .set_eeprom             = exanic_netdev_set_eeprom
 };
 
-#if defined(ETHTOOL_GET_TS_INFO) && LINUX_VERSION_CODE < KERNEL_VERSION(3, 0, 0)
-/* RedHat 2.6.x backports place get_ts_info in ethtool_ops_ext */
+#if __RH_ETHTOOL_OPS_EXT
+/* RedHat 2.6.x backports place get_ts_info, among other things,
+ * in ethtool_ops_ext */
 static struct ethtool_ops_ext exanic_ethtool_ops_ext = {
     .size                   = sizeof(struct ethtool_ops_ext),
-    .get_ts_info            = exanic_netdev_get_ts_info
+#ifdef ETHTOOL_GET_TS_INFO
+    .get_ts_info            = exanic_netdev_get_ts_info,
+#endif
+#ifdef ETHTOOL_GMODULEINFO
+    .get_module_info        = exanic_netdev_get_module_info,
+    .get_module_eeprom      = exanic_netdev_get_module_eeprom,
+#endif
+#ifdef ETHTOOL_PHYS_ID
+    .set_phys_id            = exanic_netdev_set_phys_id,
+#endif
 };
 #define SET_ETHTOOL_OPS_EXT(ndev, ops) set_ethtool_ops_ext(ndev, ops)
 #else
@@ -1355,8 +1641,10 @@ static int exanic_netdev_poll(struct napi_struct *napi, int budget)
     int received = 0, chunk_count = 0;
     ssize_t len;
     uint32_t chunk_id = 0, tstamp;
+    uint8_t matched_filter = 0;
+    uint16_t chunk_status;
     char *ptr = NULL;
-    int more_chunks = 0;
+    bool more_chunks = false;
     ktime_t interval;
 
     while (received < budget && chunk_count < POLL_MAX_CHUNKS)
@@ -1372,25 +1660,57 @@ static int exanic_netdev_poll(struct napi_struct *napi, int budget)
         }
 
         chunk_count++;
-        len = exanic_receive_chunk_inplace(rx, &ptr, &chunk_id, &more_chunks);
+        len = exanic_receive_chunk_inplace(rx, &ptr, &chunk_id, &matched_filter, &chunk_status, &more_chunks);
         if (len == 0)
-            break;
-        else if (len < 0)
         {
-            /* Receive error */
-            ndev->stats.rx_errors++;
-            if (len == -EXANIC_RX_FRAME_SWOVFL)
-                ndev->stats.rx_fifo_errors++;
-            else if (len == -EXANIC_RX_FRAME_CORRUPT)
-                ndev->stats.rx_crc_errors++;
-            dev_kfree_skb(priv->skb);
-            priv->skb = NULL;
-            received++;
-            continue;
+            /* No (more) packet chunks currently waiting. */
+            break;
         }
-        else if (len > skb_tailroom(priv->skb))
+
+        if (chunk_status)
+        {
+            ndev->stats.rx_errors++;
+
+            /* If there's been a chunk error, no more chunks on this frame */
+            more_chunks = false;
+
+            switch (chunk_status)
+            {
+            case EXANIC_RX_FRAME_CORRUPT:
+                ndev->stats.rx_crc_errors++;
+                break;
+            case EXANIC_RX_FRAME_ABORTED:
+                ndev->stats.rx_length_errors++;
+                break;
+            case EXANIC_RX_FRAME_SWOVFL: /* Implies len < 0 */
+                ndev->stats.rx_fifo_errors++;
+                if ( priv->skb->len == 0 )
+                {
+                    /* There is no frame data so far received, so try again, but
+                     * don't bother to reallocate the SKB since we have a fresh
+                     * one already */
+                    continue;
+                }
+                break;
+            }
+
+            /* We have frame data, drop it unless the user has asked us not to */
+#ifdef NETIF_F_RXALL
+            if ( !(ndev->features & NETIF_F_RXALL) )
+#endif
+            {
+                dev_kfree_skb (priv->skb);
+                priv->skb = NULL;
+                continue;
+            }
+        }
+
+        if (len > skb_tailroom(priv->skb))
         {
             /* Packet too large */
+            ndev->stats.rx_errors++;
+            ndev->stats.rx_length_errors++;
+
             len = skb_tailroom(priv->skb);
             priv->length_error = true;
         }
@@ -1427,6 +1747,12 @@ static int exanic_netdev_poll(struct napi_struct *napi, int budget)
                 continue;
             }
 
+            /* Take the last 4B (CRC) off the frame unless user wants it */
+#ifdef NETIF_F_RXFCS
+            if ( !(ndev->features & NETIF_F_RXFCS) )
+#endif
+                skb_trim(priv->skb, priv->skb->len - 4);
+
             priv->skb->protocol = eth_type_trans(priv->skb, ndev);
 
             /* Calculate hardware timestamp if enabled */
@@ -1439,8 +1765,16 @@ static int exanic_netdev_poll(struct napi_struct *napi, int budget)
             ndev->stats.rx_packets++;
             ndev->stats.rx_bytes += priv->skb->len;
 
-            /* Deliver packet to intercept functions or kernel stack */
-            exanic_deliver_skb(priv->skb);
+            /* Deliver packet to intercept functions or kernel stack
+             * ATE availability check necessary to avoid treating DMA
+             * traffic from non-ATE ports with rx_match_host equal to
+             * EXANIC_ATE_FILTER_REFLECTED as ATE-generated data */
+            if (matched_filter == EXANIC_ATE_FILTER_REFLECTED &&
+                exanic_ate_available(priv->exanic, priv->port))
+                exanic_ate_deliver_skb(priv->skb);
+            else
+                exanic_deliver_skb(priv->skb);
+
             priv->skb = NULL;
             received++;
         }
@@ -1543,6 +1877,19 @@ int exanic_netdev_alloc(struct exanic *exanic, unsigned port,
         priv->bypass_only = true;
     }
 
+    /*
+     * ExaNICs are different to other NICs because hardware is cut-through. This
+     * means that they forward CRCs and broken frames by default. Other NICs
+     * will drop these by default. So, while forwarding CRCs and broken frames
+     * is a HW feature on most NICs, it is actually a SW feature on ExaNICs,
+     * (ie to strip CRCs and drop broken frames). To keep the user facing
+     * experience consistent, we mark these as HW features here, but actually
+     * implement in SW in the SKB RX path.
+     */
+#ifdef NETIF_F_RXALL
+    ndev->hw_features = NETIF_F_RXALL | NETIF_F_RXFCS ;
+#endif
+
     err = register_netdev(ndev);
     if (err)
         goto err_register;
@@ -1586,16 +1933,24 @@ void exanic_netdev_check_link(struct net_device *ndev)
     if (reg & EXANIC_PORT_STATUS_LINK)
     {
         if (!netif_carrier_ok(ndev))
+        {
             netif_carrier_on(ndev);
+            reg = readl(&priv->registers[REG_PORT_INDEX(priv->port,
+                        REG_PORT_SPEED)]);
+            netdev_info(ndev, "Link is up at %d Mbps", reg);
+        }
     }
     else if (netif_carrier_ok(ndev))
+    {
         netif_carrier_off(ndev);
+        netdev_info(ndev, "Link is down");
+    }
 }
 
 /**
  * Send a packet on an ExaNIC interface.
  */
-int exanic_transmit_frame(struct net_device *ndev, struct sk_buff *skb)
+int exanic_netdev_transmit_frame(struct net_device *ndev, struct sk_buff *skb)
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
     int err;
@@ -1611,13 +1966,13 @@ int exanic_transmit_frame(struct net_device *ndev, struct sk_buff *skb)
         return -1;
     }
 
-    err = __exanic_transmit_frame(&priv->tx, skb);
+    err = exanic_transmit_frame(&priv->tx, skb);
 
     spin_unlock_irqrestore(&priv->tx_lock, flags);
     dev_kfree_skb(skb);
     return err;
 }
-EXPORT_SYMBOL(exanic_transmit_frame);
+EXPORT_SYMBOL(exanic_netdev_transmit_frame);
 
 /**
  * Add a function to intercept incoming frames before the Linux stack.

@@ -10,6 +10,11 @@
 #include <linux/ptp_clock_kernel.h>
 #endif
 
+#include "exanic-phyops.h"
+
+#include "../../libs/exanic/const.h"
+#include "../../libs/exanic/hw_info.h"
+
 /**
  * A context is allocated for each open file descriptor and for each
  * in-kernel user of the driver.
@@ -29,7 +34,9 @@ struct exanic_ctx
 struct exanic_port
 {
     void *rx_region_virt;
+    void *ate_rx_region_virt;
     dma_addr_t rx_region_dma;
+    dma_addr_t ate_rx_region_dma;
     unsigned int rx_refcount; /* Only counts in-kernel users. */
     unsigned numa_node;
     size_t tx_region_usable_offset;
@@ -47,6 +54,12 @@ struct exanic_port
     struct exanic_ip_filter_slot *ip_filter_slots;
     struct exanic_mac_filter_slot *mac_filter_slots;
     spinlock_t filter_lock;
+
+    bool has_ate;
+    struct semaphore ate_lockbox[EXANIC_ATE_ENGINES_PER_PORT];
+
+    /* phy operations associated with this port */
+    struct exanic_phy_ops phy_ops;
 
     /* MAC address before any user changes */
     unsigned char orig_mac_addr[ETH_ALEN];
@@ -76,12 +89,16 @@ struct exanic
     void *tx_region_virt;
     void *devkit_regs_virt;
     void *devkit_mem_virt;
+    void *devkit_regs_ex_virt;
+    void *devkit_mem_ex_virt;
     struct exanic_info_page *info_page;
     phys_addr_t regs_phys;
     phys_addr_t filters_phys;
     phys_addr_t tx_region_phys;
     phys_addr_t devkit_regs_phys;
     phys_addr_t devkit_mem_phys;
+    phys_addr_t devkit_regs_ex_phys;
+    phys_addr_t devkit_mem_ex_phys;
     dma_addr_t tx_feedback_dma;
 
     unsigned int dma_addr_bits;
@@ -102,11 +119,16 @@ struct exanic
     unsigned int function_id;
     unsigned int id;
     unsigned int devkit_regs_offset;
+    size_t       devkit_regs_size;
     unsigned int devkit_mem_offset;
+    size_t       devkit_mem_size;
+    size_t       devkit_regs_ex_size;
+    size_t       devkit_mem_ex_size;
     unsigned int num_ports;
     uint32_t caps;
 
-    char name[8];
+    char name[10];
+    char serial[20];
 
     struct net_device *ndev[EXANIC_MAX_PORTS];
 
@@ -121,11 +143,23 @@ struct exanic
 
     struct hrtimer phc_pps_hrtimer;
     bool phc_pps_enabled;
-    time_t last_phc_pps;
+    long last_phc_pps;
 
     enum per_out_mode per_out_mode;
     ktime_t per_out_start;
 #endif
+
+    bool unsupported;
+    bool reset_on_remove;
+    struct exanic_hw_info hwinfo;
+
+    /* i2c related structures */
+    struct list_head i2c_list;
+    struct mutex i2c_lock;
+
+    struct i2c_adapter *xcvr_i2c_adapters[EXANIC_MAX_PORTS];
+    struct i2c_adapter *ext_phy_i2c_adapters[EXANIC_MAX_PORTS];
+    struct i2c_adapter *eep_i2c_adapter;
 };
 
 /* Each context holds a reference to buffers it
@@ -137,7 +171,7 @@ struct exanic_filter_buffer_ref
     int buffer;
 };
 
-struct exanic_filter_buffer 
+struct exanic_filter_buffer
 {
     void *region_virt;
     dma_addr_t region_dma;
@@ -197,6 +231,11 @@ static inline char *exanic_tx_region(struct exanic *exanic)
 static inline void *exanic_rx_region(struct exanic *exanic, unsigned port_num)
 {
     return exanic->port[port_num].rx_region_virt;
+}
+
+static inline void *exanic_ate_rx_region(struct exanic *exanic, unsigned port_num)
+{
+    return exanic->port[port_num].ate_rx_region_virt;
 }
 
 #endif /* _EXANIC_STRUCTS_H_ */

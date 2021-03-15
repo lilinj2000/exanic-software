@@ -19,10 +19,13 @@
 #include <poll.h>
 #include <time.h>
 
+#include <exasock/socket.h>
+
 #include "../kernel/api.h"
 #include "../kernel/structs.h"
 #include "../lock.h"
 #include "../rwlock.h"
+#include "../warn.h"
 #include "../structs.h"
 #include "../sockets.h"
 #include "../exanic.h"
@@ -35,14 +38,25 @@
 #include "trace.h"
 #include "common.h"
 
+/* Calculate total length of iovec */
+static inline size_t
+__iovec_total_len(const struct iovec *iov, size_t iovcnt)
+{
+    size_t len = 0, i;
+    for (i = 0; i < iovcnt; i++)
+        len += iov[i].iov_len;
+    return len;
+}
+
 static ssize_t
 sendto_bypass_udp(struct exa_socket * restrict sock, int sockfd,
                   const void *buf, size_t len, int flags,
                   const struct sockaddr *dest_addr, socklen_t addrlen)
 {
+    bool warm = !!(flags & MSG_EXA_WARM);
     ssize_t ret;
 
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
     assert(sock->domain == AF_INET);
     assert(sock->type == SOCK_DGRAM);
     assert(exa_read_locked(&sock->lock));
@@ -74,7 +88,7 @@ sendto_bypass_udp(struct exa_socket * restrict sock, int sockfd,
         }
     }
 
-    ret = exanic_udp_send(sock, buf, len);
+    ret = exanic_udp_send(sock, buf, len, warm);
     exa_unlock(&sock->state->tx_lock);
     return ret;
 }
@@ -92,9 +106,10 @@ sendto_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
                   const struct sockaddr *dest_addr, socklen_t addrlen)
 {
     bool nonblock = (flags & MSG_DONTWAIT) || (sock->flags & O_NONBLOCK);
+    bool warm = !!(flags & MSG_EXA_WARM);
     ssize_t nwritten, ret;
 
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
     assert(sock->domain == AF_INET);
     assert(sock->type == SOCK_STREAM);
     assert(exa_read_locked(&sock->lock));
@@ -114,7 +129,7 @@ sendto_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
         exa_lock(&sock->state->tx_lock);
         while (nwritten < len)
         {
-            ret = exanic_tcp_send(sock, buf + nwritten, len - nwritten);
+            ret = exanic_tcp_send(sock, buf + nwritten, len - nwritten, warm);
             if (ret <= 0)
                 break;
             nwritten += ret;
@@ -128,7 +143,10 @@ sendto_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
         if (ret == -1)
         {
             /* FIXME: Emit signal */
-            errno = EPIPE;
+            if (sock->state->error == ETIMEDOUT)
+                errno = sock->state->error;
+            else
+                errno = EPIPE;
             break;
         }
 
@@ -152,7 +170,7 @@ sendto_bypass(struct exa_socket * restrict sock, int sockfd,
               const struct sockaddr *dest_addr, socklen_t addrlen)
 {
     assert(exa_read_locked(&sock->lock));
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
 
     if (sock->domain == AF_INET && sock->type == SOCK_DGRAM)
         return sendto_bypass_udp(sock, sockfd, buf, len, flags,
@@ -182,15 +200,33 @@ send(int sockfd, const void *buf, size_t len, int flags)
     TRACE_FLUSH();
 
     if (sock == NULL)
-        ret = LIBC(send, sockfd, buf, len, flags);
+    {
+        if (flags & MSG_EXA_WARM)
+        {
+            WARNING_MSGWARM(sockfd);
+            ret = len;
+        }
+        else
+        {
+            ret = LIBC(send, sockfd, buf, len, flags);
+        }
+    }
     else
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             exa_read_unlock(&sock->lock);
-            ret = LIBC(send, sockfd, buf, len, flags);
+            if (flags & MSG_EXA_WARM)
+            {
+                WARNING_MSGWARM(sockfd);
+                ret = len;
+            }
+            else
+            {
+                ret = LIBC(send, sockfd, buf, len, flags);
+            }
         }
         else if (sock->connected)
         {
@@ -218,15 +254,26 @@ auto_bind(struct exa_socket * restrict sock, int sockfd,
 
     assert(exa_write_locked(&sock->lock));
 
-    if (sock->bypass)
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE)
     {
         /* Someone beat us to it - this is possible because we test
          * sock->bypass before acquiring the lock */
         return 0;
     }
 
-    if (sock->disable_bypass)
-        return 0; /* falls through to native */
+    if (override_unsafe)
+    {
+        /* Inside a libc function that is known to be incompatible with
+         * bypass sockets */
+        return 0;
+    }
+
+    if (sock->bypass_state <= EXA_BYPASS_INACTIVE)
+    {
+        /* Bypass is either disabled by default or permanently disabled
+         * for this socket */
+        return 0;
+    }
 
     if (sock->domain == AF_INET && sock->type == SOCK_DGRAM)
     {
@@ -243,10 +290,7 @@ auto_bind(struct exa_socket * restrict sock, int sockfd,
              * On successful return we hold rx_lock and tx_lock */
             ret = exa_socket_enable_bypass(sock);
             if (ret == -1)
-            {
-                exa_write_unlock(&sock->lock);
                 return -1;
-            }
 
             exa_unlock(&sock->state->rx_lock);
             exa_unlock(&sock->state->tx_lock);
@@ -279,10 +323,20 @@ sendto(int sockfd, const void *buf, size_t len, int flags,
     TRACE_FLUSH();
 
     if (sock == NULL)
-        ret = LIBC(sendto, sockfd, buf, len, flags, dest_addr, addrlen);
+    {
+        if (flags & MSG_EXA_WARM)
+        {
+            WARNING_MSGWARM(sockfd);
+            ret = len;
+        }
+        else
+        {
+            ret = LIBC(sendto, sockfd, buf, len, flags, dest_addr, addrlen);
+        }
+    }
     else
     {
-        if (!sock->bypass && dest_addr != NULL)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE && dest_addr != NULL)
         {
             exa_write_lock(&sock->lock);
 
@@ -303,10 +357,19 @@ sendto(int sockfd, const void *buf, size_t len, int flags,
 
         assert(exa_read_locked(&sock->lock));
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             exa_read_unlock(&sock->lock);
-            ret = LIBC(sendto, sockfd, buf, len, flags, dest_addr, addrlen);
+
+            if (flags & MSG_EXA_WARM)
+            {
+                WARNING_MSGWARM(sockfd);
+                ret = len;
+            }
+            else
+            {
+                ret = LIBC(sendto, sockfd, buf, len, flags, dest_addr, addrlen);
+            }
         }
         else
         {
@@ -324,9 +387,10 @@ static ssize_t
 sendmsg_bypass_udp(struct exa_socket * restrict sock, int sockfd,
                    const struct msghdr *msg, int flags)
 {
+    bool warm = !!(flags & MSG_EXA_WARM);
     ssize_t ret;
 
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
     assert(sock->domain == AF_INET);
     assert(sock->type == SOCK_DGRAM);
 
@@ -369,7 +433,7 @@ sendmsg_bypass_udp(struct exa_socket * restrict sock, int sockfd,
         }
     }
 
-    ret = exanic_udp_send_iov(sock, msg->msg_iov, msg->msg_iovlen);
+    ret = exanic_udp_send_iov(sock, msg->msg_iov, msg->msg_iovlen, warm);
 
     exa_unlock(&sock->state->tx_lock);
     return ret;
@@ -387,10 +451,11 @@ sendmsg_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
                    const struct msghdr *msg, int flags)
 {
     bool nonblock = (flags & MSG_DONTWAIT) || (sock->flags & O_NONBLOCK);
+    bool warm = !!(flags & MSG_EXA_WARM);
     ssize_t nwritten, ret;
-    size_t count, i;
+    size_t count;
 
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
     assert(sock->domain == AF_INET);
     assert(sock->type == SOCK_STREAM);
     assert(exa_read_locked(&sock->lock));
@@ -402,9 +467,7 @@ sendmsg_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
     }
 
     /* Calculate total length of iovec */
-    count = 0;
-    for (i = 0; i < msg->msg_iovlen; i++)
-        count += msg->msg_iov[i].iov_len;
+    count = __iovec_total_len(msg->msg_iov, msg->msg_iovlen);
 
     /* Provided address in msg_name is ignored */
 
@@ -416,7 +479,7 @@ sendmsg_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
         while (nwritten < count)
         {
             ret = exanic_tcp_send_iov(sock, msg->msg_iov, msg->msg_iovlen,
-                                      nwritten, count - nwritten);
+                                      nwritten, count - nwritten, warm);
             if (ret <= 0)
                 break;
             nwritten += ret;
@@ -430,7 +493,10 @@ sendmsg_bypass_tcp(struct exa_socket * restrict sock, int sockfd,
         if (ret == -1)
         {
             /* FIXME: Emit signal */
-            errno = EPIPE;
+            if (sock->state->error == ETIMEDOUT)
+                errno = sock->state->error;
+            else
+                errno = EPIPE;
             break;
         }
 
@@ -453,7 +519,7 @@ sendmsg_bypass(struct exa_socket * restrict sock, int sockfd,
                const struct msghdr *msg, int flags)
 {
     assert(exa_read_locked(&sock->lock));
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
 
     if (sock->domain == AF_INET && sock->type == SOCK_DGRAM)
         return sendmsg_bypass_udp(sock, sockfd, msg, flags);
@@ -466,6 +532,9 @@ sendmsg_bypass(struct exa_socket * restrict sock, int sockfd,
     }
 }
 
+/* If you modify the logic in this function, be sure to make
+ * accompanying modifictions to `sendmmsg()` as well
+ */
 __attribute__((visibility("default")))
 ssize_t
 sendmsg(int sockfd, const struct msghdr *msg, int flags)
@@ -480,10 +549,20 @@ sendmsg(int sockfd, const struct msghdr *msg, int flags)
     TRACE_FLUSH();
 
     if (sock == NULL)
-        ret = LIBC(sendmsg, sockfd, msg, flags);
+    {
+        if (flags & MSG_EXA_WARM)
+        {
+            WARNING_MSGWARM(sockfd);
+            ret = __iovec_total_len(msg->msg_iov, msg->msg_iovlen);
+        }
+        else
+        {
+            ret = LIBC(sendmsg, sockfd, msg, flags);
+        }
+    }
     else
     {
-        if (!sock->bypass && msg->msg_name != NULL)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE && msg->msg_name != NULL)
         {
             exa_write_lock(&sock->lock);
 
@@ -503,10 +582,18 @@ sendmsg(int sockfd, const struct msghdr *msg, int flags)
 
         assert(exa_read_locked(&sock->lock));
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             exa_read_unlock(&sock->lock);
-            ret = LIBC(sendmsg, sockfd, msg, flags);
+            if (flags & MSG_EXA_WARM)
+            {
+                WARNING_MSGWARM(sockfd);
+                ret = __iovec_total_len(msg->msg_iov, msg->msg_iovlen);
+            }
+            else
+            {
+                ret = LIBC(sendmsg, sockfd, msg, flags);
+            }
         }
         else
         {
@@ -516,6 +603,114 @@ sendmsg(int sockfd, const struct msghdr *msg, int flags)
     }
 
     TRACE_RETURN(LONG, ret);
+    return ret;
+}
+
+/* If you modify the logic in this function, be sure to make
+ * accompanying modifictions to `sendmsg()` as well
+ */
+__attribute__((visibility("default")))
+int
+sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
+	 int flags)
+{
+    struct exa_socket * restrict sock = exa_socket_get(sockfd);
+    int ret = 0;
+    int i;
+
+    TRACE_CALL("sendmmsg");
+    TRACE_ARG(INT, sockfd);
+    TRACE_ARG(MMSG_PTR, msgvec, SSIZE_MAX);
+    TRACE_ARG(INT, vlen);
+    TRACE_LAST_ARG(BITS, flags, msg_flags);
+    TRACE_FLUSH();
+
+    if (sock == NULL)
+    {
+        if (flags & MSG_EXA_WARM)
+        {
+            WARNING_MSGWARM(sockfd);
+            for (i = 0; i < vlen; i++)
+            {
+                ret += __iovec_total_len(msgvec[i].msg_hdr.msg_iov,
+                                         msgvec[i].msg_hdr.msg_iovlen);
+            }
+        }
+        else
+            ret = LIBC(sendmmsg, sockfd, msgvec, vlen, flags);
+
+        TRACE_RETURN(INT, ret);
+        return ret;
+    }
+
+    /* We need to process each destination address one by one. */
+    for (i = 0; i < vlen; i++)
+    {
+        struct msghdr *currmsg = &msgvec[i].msg_hdr;
+        int tmpret;
+
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE && currmsg->msg_name != NULL)
+        {
+            exa_write_lock(&sock->lock);
+
+            if (auto_bind(sock, sockfd,
+                          currmsg->msg_name, currmsg->msg_namelen) != 0)
+            {
+                exa_write_unlock(&sock->lock);
+
+                /* If no messages were successfully sent at all, return -1 */
+                if (ret == 0)
+                    ret = -1;
+
+                /* ENETUNREACH not a standard return value for sendmmsg, but it
+                 * best reflects this situation.
+                 */
+                errno = ENETUNREACH;
+                TRACE_RETURN(INT, ret);
+                return ret;
+            }
+
+            exa_rwlock_downgrade(&sock->lock);
+        }
+        else
+            exa_read_lock(&sock->lock);
+
+        assert(exa_read_locked(&sock->lock));
+
+        tmpret = 0;
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
+        {
+            exa_read_unlock(&sock->lock);
+            if (flags & MSG_EXA_WARM)
+            {
+                WARNING_MSGWARM(sockfd);
+                tmpret = __iovec_total_len(currmsg->msg_iov, currmsg->msg_iovlen);
+            }
+            else
+                tmpret = LIBC(sendmsg, sockfd, currmsg, flags);
+        }
+        else
+        {
+            tmpret = sendmsg_bypass(sock, sockfd, currmsg, flags);
+            exa_read_unlock(&sock->lock);
+        }
+
+        if (tmpret < 0)
+        {
+            /* Exit early on the first failure, returning the number
+             * of successfully sent msgs.
+             */
+            if (ret == 0)
+                ret = tmpret;
+
+            TRACE_RETURN(INT, ret);
+            return ret;
+        }
+        else
+            ret += (tmpret > 0) ? 1 : 0;
+    }
+
+    TRACE_RETURN(INT, ret);
     return ret;
 }
 
@@ -529,7 +724,7 @@ write_bypass_udp(struct exa_socket * restrict sock, int fd, const void *buf,
     assert(sock->connected);
 
     exa_lock(&sock->state->tx_lock);
-    ret = exanic_udp_send(sock, buf, count);
+    ret = exanic_udp_send(sock, buf, count, false);
     exa_unlock(&sock->state->tx_lock);
 
     return ret;
@@ -559,7 +754,8 @@ write_bypass_tcp(struct exa_socket * restrict sock, int fd, const void *buf,
         exa_lock(&sock->state->tx_lock);
         while (nwritten < count)
         {
-            ret = exanic_tcp_send(sock, buf + nwritten, count - nwritten);
+            ret = exanic_tcp_send(sock, buf + nwritten, count - nwritten,
+                                  false);
             if (ret <= 0)
                 break;
             nwritten += ret;
@@ -573,7 +769,10 @@ write_bypass_tcp(struct exa_socket * restrict sock, int fd, const void *buf,
         if (ret == -1)
         {
             /* FIXME: Emit signal */
-            errno = EPIPE;
+            if (sock->state->error == ETIMEDOUT)
+                errno = sock->state->error;
+            else
+                errno = EPIPE;
             break;
         }
 
@@ -625,7 +824,7 @@ write(int fd, const void *buf, size_t count)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             exa_read_unlock(&sock->lock);
             ret = LIBC(write, fd, buf, count);
@@ -657,7 +856,7 @@ writev_bypass_udp(struct exa_socket * restrict sock, int fd,
     assert(sock->connected);
 
     exa_lock(&sock->state->tx_lock);
-    ret = exanic_udp_send_iov(sock, iov, iovcnt);
+    ret = exanic_udp_send_iov(sock, iov, iovcnt, false);
     exa_unlock(&sock->state->tx_lock);
 
     return ret;
@@ -676,15 +875,13 @@ writev_bypass_tcp(struct exa_socket * restrict sock, int fd,
 {
     bool nonblock = (sock->flags & O_NONBLOCK);
     ssize_t nwritten, ret;
-    size_t count, i;
+    size_t count;
 
     assert(exa_read_locked(&sock->lock));
     assert(sock->connected);
 
     /* Calculate total length of iovec */
-    count = 0;
-    for (i = 0; i < iovcnt; i++)
-        count += iov[i].iov_len;
+    count = __iovec_total_len(iov, iovcnt);
 
     nwritten = 0;
     while (true)
@@ -694,7 +891,7 @@ writev_bypass_tcp(struct exa_socket * restrict sock, int fd,
         while (nwritten < count)
         {
             ret = exanic_tcp_send_iov(sock, iov, iovcnt, nwritten,
-                                      count - nwritten);
+                                      count - nwritten, false);
             if (ret <= 0)
                 break;
             nwritten += ret;
@@ -708,7 +905,10 @@ writev_bypass_tcp(struct exa_socket * restrict sock, int fd,
         if (ret == -1)
         {
             /* FIXME: Emit signal */
-            errno = EPIPE;
+            if (sock->state->error == ETIMEDOUT)
+                errno = sock->state->error;
+            else
+                errno = EPIPE;
             break;
         }
 
@@ -760,7 +960,7 @@ writev(int fd, const struct iovec *iov, int iovcnt)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             exa_read_unlock(&sock->lock);
             ret = LIBC(writev, fd, iov, iovcnt);

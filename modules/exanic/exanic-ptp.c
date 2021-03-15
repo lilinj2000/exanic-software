@@ -23,6 +23,14 @@
 #define PTP_1588_CLOCK_USES_TIMESPEC64
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+#define linux_ktime_to_timespec(ktime) ktime_to_timespec64((ktime))
+typedef struct timespec64 linux_timespec_t;
+#else
+#define linux_ktime_to_timespec(ktime) ktime_to_timespec((ktime))
+typedef struct timespec linux_timespec_t;
+#endif
+
 #if defined(CONFIG_PTP_1588_CLOCK) || defined(CONFIG_PTP_1588_CLOCK_MODULE)
 
 #define PPS_DELAY_NS 100000
@@ -45,17 +53,6 @@ typedef struct timespec64 ptp_timespec_t;
 typedef struct timespec ptp_timespec_t;
 #define ktime_to_ptp_timespec_t(ktime) ktime_to_timespec(ktime)
 #endif
-
-#define EXANIC_SUPPORTS_PER_OUT(exanic) \
-    ((exanic)->hw_id == EXANIC_HW_X10 || \
-     (exanic)->hw_id == EXANIC_HW_X40 || \
-     (exanic)->hw_id == EXANIC_HW_X10_GM || \
-     (exanic)->hw_id == EXANIC_HW_X10_HPT) || \
-     (exanic)->hw_id == EXANIC_HW_V5P
-
-#define EXANIC_SUPPORTS_PER_OUT_10M(exanic) \
-    ((exanic)->hw_id == EXANIC_HW_X10_GM || \
-     (exanic)->hw_id == EXANIC_HW_X10_HPT)
 
 static uint64_t exanic_ptp_read_hw_time(struct exanic *exanic);
 static uint64_t exanic_ptp_soft_extend_hw_time(struct exanic *exanic,
@@ -226,7 +223,8 @@ static ktime_t next_pps_time(struct exanic *exanic)
     time_mono = ktime_get();
 
     /* Calculate time until next second boundary */
-    ns = NSEC_PER_SEC - ktime_to_timespec(time_hw).tv_nsec + PPS_DELAY_NS;
+    ns = NSEC_PER_SEC -
+        linux_ktime_to_timespec(time_hw).tv_nsec + PPS_DELAY_NS;
 
     return ktime_add_ns(time_mono, ns);
 }
@@ -243,7 +241,7 @@ static enum hrtimer_restart exanic_ptp_pps_hrtimer_callback(
     unsigned long flags;
     ktime_t hw_time, mono_time;
     uint32_t hw_time_reg;
-    struct timespec hw_time_ts;
+    linux_timespec_t hw_time_ts;
     uint64_t expiry;
 
     if (!exanic->phc_pps_enabled)
@@ -263,10 +261,14 @@ static enum hrtimer_restart exanic_ptp_pps_hrtimer_callback(
     local_irq_restore(flags);
 
     hw_time = exanic_ptp_time_to_ktime(exanic, hw_time_reg);
-    hw_time_ts = ktime_to_timespec(hw_time);
+    hw_time_ts = linux_ktime_to_timespec(hw_time);
 
     /* Get the system time at the last second boundary */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+    pps_sub_ts(&event.pps_times, ns_to_timespec64(hw_time_ts.tv_nsec));
+#else
     pps_sub_ts(&event.pps_times, ns_to_timespec(hw_time_ts.tv_nsec));
+#endif
 
     /* Set next expiry to be just after the next second boundary */
     expiry = NSEC_PER_SEC - hw_time_ts.tv_nsec + PPS_DELAY_NS;
@@ -281,8 +283,8 @@ static enum hrtimer_restart exanic_ptp_pps_hrtimer_callback(
         /* Timer may have fired too late or too early */
         if (exanic->last_phc_pps != 0 &&
                 exanic->last_phc_pps < hw_time_ts.tv_sec)
-            dev_err(dev, "Missed PPS event at time=%ld delay=%ld\n",
-                    hw_time_ts.tv_sec, hw_time_ts.tv_nsec);
+            dev_err(dev, "Missed PPS event at time=%lld delay=%ld\n",
+                    (long long)hw_time_ts.tv_sec, hw_time_ts.tv_nsec);
 
         /* Monotonic clock may be too fast or slow, so use a short timeout to
          * ensure the next second boundary is not missed */
@@ -556,9 +558,9 @@ static int exanic_phc_enable(struct ptp_clock_info *ptp,
             else
                 return -EINVAL;
 
-            /* 100ns period is only supported on X10-GM/X10-HPT */
+            /* Check feature flags for 100ns periodic output support */
             if (per_out_mode == PER_OUT_10M &&
-                    !EXANIC_SUPPORTS_PER_OUT_10M(exanic))
+                !(exanic->hwinfo.flags & EXANIC_HW_FLAG_PER_OUT_10M))
                 return -EINVAL;
         }
 
@@ -616,6 +618,7 @@ static const struct ptp_clock_info exanic_ptp_clock_info = {
 void exanic_ptp_init(struct exanic *exanic)
 {
     struct device *dev = &exanic->pci_dev->dev;
+    uint32_t reg;
     uint64_t time_ticks;
 
     exanic->tick_hz =
@@ -636,8 +639,8 @@ void exanic_ptp_init(struct exanic *exanic)
         exanic->ptp_clock_info.max_adj = 1953124;
     else
         exanic->ptp_clock_info.max_adj = 100000000;
-    /* Periodic output is only available on X10/X40/X10-GM/X10-HPT */
-    if (EXANIC_SUPPORTS_PER_OUT(exanic))
+    /* Check feature flag for periodic output */
+    if (exanic->hwinfo.flags & EXANIC_HW_FLAG_PER_OUT)
         exanic->ptp_clock_info.n_per_out = 1;
     else
         exanic->ptp_clock_info.n_per_out = 0;
@@ -664,11 +667,26 @@ void exanic_ptp_init(struct exanic *exanic)
     dev_info(dev, "PTP hardware clock registered (ptp%i)",
             ptp_clock_index(exanic->ptp_clock));
 
-    if (EXANIC_SUPPORTS_PER_OUT(exanic))
+    if (exanic->hwinfo.flags & EXANIC_HW_FLAG_PER_OUT)
     {
-        /* Disable periodic output */
-        writel(0, exanic->regs_virt + REG_HW_OFFSET(REG_HW_PER_OUT_WIDTH));
-        writel(0, exanic->regs_virt + REG_HW_OFFSET(REG_HW_PER_OUT_CONFIG));
+        /* PPS configs are restored from EEPROM on some cards
+         * following reset */
+        if (exanic->hwinfo.flags & EXANIC_HW_FLAG_PER_OUT_EEP)
+        {
+            reg = readl(exanic->regs_virt + REG_HW_OFFSET(REG_HW_PER_OUT_CONFIG));
+            if (reg & EXANIC_HW_PER_OUT_CONFIG_PPS)
+                exanic->per_out_mode = PER_OUT_1PPS;
+            else if (reg & EXANIC_HW_PER_OUT_CONFIG_10M)
+                exanic->per_out_mode = PER_OUT_10M;
+            else
+                exanic->per_out_mode = PER_OUT_NONE;
+        }
+        else
+        {
+            /* Disable periodic output */
+            writel(0, exanic->regs_virt + REG_HW_OFFSET(REG_HW_PER_OUT_WIDTH));
+            writel(0, exanic->regs_virt + REG_HW_OFFSET(REG_HW_PER_OUT_CONFIG));
+        }
     }
 
     if (exanic_ptp_adj_allowed(exanic))

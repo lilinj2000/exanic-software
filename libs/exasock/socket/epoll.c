@@ -152,10 +152,10 @@ epoll_ctl_add(struct exa_notify * restrict no, int epfd,
     assert(sock != NULL);
     assert(exa_write_locked(&sock->lock));
 
-    if (!sock->bypass)
+    if (sock->bypass_state != EXA_BYPASS_ACTIVE)
     {
         /* Check that we have space to record the epoll membership */
-        if (sock->num_epoll_fd > MAX_NUM_EPOLL)
+        if (sock->num_epoll_fd >= MAX_NUM_EPOLL)
         {
             errno = ENOMEM;
             return -1;
@@ -193,7 +193,7 @@ epoll_ctl_mod(struct exa_notify * restrict no, int epfd,
     assert(sock != NULL);
     assert(exa_write_locked(&sock->lock));
 
-    if (!sock->bypass)
+    if (sock->bypass_state != EXA_BYPASS_ACTIVE)
     {
         /* Update kernel epoll */
         if (LIBC(epoll_ctl, epfd, EPOLL_CTL_MOD, fd, event) == -1)
@@ -224,7 +224,7 @@ epoll_ctl_del(struct exa_notify * restrict no, int epfd,
     assert(sock != NULL);
     assert(exa_write_locked(&sock->lock));
 
-    if (!sock->bypass)
+    if (sock->bypass_state != EXA_BYPASS_ACTIVE)
     {
         /* Remove from kernel epoll */
         LIBC(epoll_ctl, epfd, EPOLL_CTL_DEL, fd, NULL);
@@ -318,7 +318,7 @@ epoll_pwait_spin_test_fd(struct exa_notify * restrict no, int fd,
 
     exa_read_lock(&sock->lock);
 
-    if (!sock->bypass)
+    if (sock->bypass_state != EXA_BYPASS_ACTIVE)
     {
         exa_read_unlock(&sock->lock);
         return false;
@@ -374,6 +374,13 @@ epoll_pwait_spin_check_fd(int fd)
         return;
 
     exa_read_lock(&sock->lock);
+
+    /* Check if socket still exists */
+    if (sock->state == NULL)
+    {
+        exa_read_unlock(&sock->lock);
+        return;
+    }
 
     exa_lock(&sock->state->rx_lock);
     exa_notify_tcp_read_update(sock);
@@ -444,10 +451,28 @@ epoll_pwait_spin(int epfd, struct epoll_event *events, int maxevents,
             while (next_rd != s->next_write)
             {
                 sock = exa_socket_get(s->fd_ready[next_rd]);
-                if (!exa_trylock(&sock->state->rx_lock))
+
+                if (!exa_read_trylock(&sock->lock))
                     break;
+
+                if (sock->state == NULL)
+                {
+                    /* Socket no longer exists */
+                    exa_read_unlock(&sock->lock);
+                    EXASOCK_EPOLL_FD_READY_IDX_INC(next_rd);
+                    continue;
+                }
+
+                if (!exa_trylock(&sock->state->rx_lock))
+                {
+                    exa_read_unlock(&sock->lock);
+                    break;
+                }
                 exa_notify_tcp_read_update(sock);
                 exa_unlock(&sock->state->rx_lock);
+
+                exa_read_unlock(&sock->lock);
+
                 EXASOCK_EPOLL_FD_READY_IDX_INC(next_rd);
             }
             s->next_read = next_rd;

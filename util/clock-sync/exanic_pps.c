@@ -45,6 +45,7 @@ struct exanic_pps_sync_state
     uint64_t last_log_ns; /* Time of last log message (ns since epoch) */
     time_t pps_last_seen; /* Time of last poll that a PPS pulse was detected
                              (CLOCK_MONOTONIC) */
+    double max_log_pps_offset; /* Max observed offset since last log entry (ns) */
 };
 
 
@@ -97,16 +98,15 @@ struct exanic_pps_sync_state *init_exanic_pps_sync(const char *name, int clkfd,
 
     /* Check for invalid settings */
     hw_id = exanic_get_hw_type(exanic);
-    if ((hw_id == EXANIC_HW_Z1 || hw_id == EXANIC_HW_Z10) &&
-            pps_type == PPS_SINGLE_ENDED)
+    if (pps_type == PPS_SINGLE_ENDED &&
+        !(exanic->hw_info.flags & EXANIC_HW_FLAG_PPS_SINGLE))
     {
         log_printf(LOG_WARNING, "%s: %s does not support single-ended PPS input",
                 state->name, exanic_hardware_id_str(hw_id));
         pps_type = PPS_DIFFERENTIAL;
     }
-    else if (((hw_id == EXANIC_HW_X10) || (hw_id == EXANIC_HW_X10_GM) ||
-                (hw_id == EXANIC_HW_X40 || (hw_id == EXANIC_HW_V5P) )) &&
-            pps_type == PPS_DIFFERENTIAL)
+    else if (pps_type == PPS_DIFFERENTIAL &&
+            !(exanic->hw_info.flags & EXANIC_HW_FLAG_PPS_DIFF))
     {
         log_printf(LOG_WARNING, "%s: %s does not support differential PPS input",
                 state->name, exanic_hardware_id_str(hw_id));
@@ -136,45 +136,33 @@ struct exanic_pps_sync_state *init_exanic_pps_sync(const char *name, int clkfd,
             state->interval);
 
     /* PPS settings */
-    if ((hw_id == EXANIC_HW_X4) || (hw_id == EXANIC_HW_X2))
-    {
-        uint32_t reg;
+    uint32_t pps_reg =
+            exanic_register_read(state->exanic, REG_HW_INDEX(REG_HW_SERIAL_PPS));
 
-        reg = exanic_register_read(state->exanic, REG_HW_INDEX(REG_HW_SERIAL_PPS));
+    if (pps_edge == PPS_RISING_EDGE)
+        pps_reg |= EXANIC_HW_SERIAL_PPS_EDGE_SEL;
+    else
+        pps_reg &= ~EXANIC_HW_SERIAL_PPS_EDGE_SEL;
 
-        if (pps_type == PPS_SINGLE_ENDED)
-            reg |= EXANIC_HW_SERIAL_PPS_SINGLE;
-        else
-            reg &= ~EXANIC_HW_SERIAL_PPS_SINGLE;
+    /* PPS input electrical characteristics */
+    if (pps_type == PPS_SINGLE_ENDED &&
+        (exanic->hw_info.flags & EXANIC_HW_FLAG_PPS_SINGLE))
+        pps_reg |= EXANIC_HW_SERIAL_PPS_SINGLE;
+    else
+        pps_reg &= ~EXANIC_HW_SERIAL_PPS_SINGLE;
 
-        if (pps_edge == PPS_RISING_EDGE)
-            reg |= EXANIC_HW_SERIAL_PPS_EDGE_SEL;
-        else
-            reg &= ~EXANIC_HW_SERIAL_PPS_EDGE_SEL;
+    /* PPS Termination Settings */
+    if (pps_termination_disable &&
+        (exanic->hw_info.flags & EXANIC_HW_FLAG_PPS_TERM))
+        pps_reg &= ~EXANIC_HW_SERIAL_PPS_TERM_EN;
+    else
+        pps_reg |= EXANIC_HW_SERIAL_PPS_TERM_EN;
 
-        exanic_register_write(state->exanic, REG_HW_INDEX(REG_HW_SERIAL_PPS), reg);
-    }
-    else if ((hw_id == EXANIC_HW_X10) || (hw_id == EXANIC_HW_X10_GM) ||
-            (hw_id == EXANIC_HW_X40))  /* PPS Termination Settings */
-    {
-        uint32_t reg;
+    /* Disable PPS output */
+    if (exanic->hw_info.flags & EXANIC_HW_FLAG_PER_OUT)
+        pps_reg &= ~EXANIC_HW_SERIAL_PPS_OUT_EN;
 
-        reg = exanic_register_read(state->exanic, REG_HW_INDEX(REG_HW_SERIAL_PPS));
-
-        if (pps_termination_disable)
-            reg &= ~EXANIC_HW_SERIAL_PPS_TERM_EN;
-        else
-            reg |= EXANIC_HW_SERIAL_PPS_TERM_EN;
-
-        if (pps_edge == PPS_RISING_EDGE)
-            reg |= EXANIC_HW_SERIAL_PPS_EDGE_SEL;
-        else
-            reg &= ~EXANIC_HW_SERIAL_PPS_EDGE_SEL;
-
-        reg &= ~EXANIC_HW_SERIAL_PPS_OUT_EN;
-
-        exanic_register_write(state->exanic, REG_HW_INDEX(REG_HW_SERIAL_PPS), reg);
-    }
+    exanic_register_write(state->exanic, REG_HW_INDEX(REG_HW_SERIAL_PPS), pps_reg);
 
     /* Don't allow too large adjustments as the algorithm cannot handle it */
     if (fabs(adj) > ERROR_MAX)
@@ -204,6 +192,8 @@ struct exanic_pps_sync_state *init_exanic_pps_sync(const char *name, int clkfd,
     state->log_reset = 0;
     state->last_log_ns = 0;
     state->pps_last_seen = ts_mono.tv_sec;
+    state->max_log_pps_offset = 0;
+
     reset_rate_error(&state->rate, state->interval);
 
     update_phc_status(clkfd, PHC_STATUS_UNKNOWN);
@@ -302,7 +292,8 @@ enum sync_status poll_exanic_pps_sync(struct exanic_pps_sync_state *state)
 
         /* What the PPS pulse time should be, in ticks since epoch */
         desired_time_tick = (uint64_t)time_sec * state->tick_hz +
-            state->offset_ns;
+            (state->offset_ns / 1000000000) * state->tick_hz +
+            (state->offset_ns % 1000000000) * state->tick_hz / 1000000000;
 
         /* Calculate offset (ns) from the desired time */
         if (pps_time_tick > desired_time_tick)
@@ -372,6 +363,8 @@ enum sync_status poll_exanic_pps_sync(struct exanic_pps_sync_state *state)
         {
             state->pps_offset = pps_offset;
             state->pps_time = time_sec;
+            if (fabs(state->pps_offset) > fabs(state->max_log_pps_offset))
+                state->max_log_pps_offset = state->pps_offset;
             good_pps_seen = 1;
         }
 
@@ -414,22 +407,30 @@ enum sync_status poll_exanic_pps_sync(struct exanic_pps_sync_state *state)
             if (!rate_error_known)
             {
                 log_printf(LOG_INFO, "%s: Clock offset at PPS pulse: "
-                        "%.4f us", state->name, state->pps_offset * 0.001);
+                        "%.4f us  max offset: %.4f us", state->name,
+                        state->pps_offset * 0.001,
+                        state->max_log_pps_offset * 0.001);
             }
             else if (!adev_known)
             {
                 log_printf(LOG_INFO, "%s: Clock offset at PPS pulse: "
-                        "%.4f us  drift: %.4f ppm", state->name,
-                        state->pps_offset * 0.001, rate_error * 1000000);
+                        "%.4f us  max offset: %.4f us  drift: %.4f ppm",
+                        state->name, state->pps_offset * 0.001,
+                        state->max_log_pps_offset * 0.001,
+                        rate_error * 1000000);
             }
             else
             {
                 log_printf(LOG_INFO, "%s: Clock offset at PPS pulse: "
-                        "%.4f us  drift: %.4f ppm  adev: %.3e",
+                        "%.4f us  max offset: %.4f us  drift: %.4f ppm"
+                        "  adev: %.3e",
                         state->name, state->pps_offset * 0.001,
+                        state->max_log_pps_offset * 0.001,
                         rate_error * 1000000, adev);
             }
+
             state->last_log_ns = poll_time_ns;
+            state->max_log_pps_offset = 0;
         }
 
         /* Slow down logging if offset is less than 1us */

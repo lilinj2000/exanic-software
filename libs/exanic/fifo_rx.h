@@ -5,6 +5,8 @@
 #ifndef EXANIC_FIFO_RX_H
 #define EXANIC_FIFO_RX_H
 
+#include <unistd.h> /* for ssize_t */
+
 #include "exanic.h"
 #include "pcie_if.h"
 #include "fifo_if.h"
@@ -55,7 +57,7 @@ typedef struct exanic_rx
  * \return A handle to the RX buffer.
  */
 exanic_rx_t * exanic_acquire_rx_buffer(exanic_t *exanic, int port_number,
-                                       int filter_number);
+                                       int buffer_number);
 
 /**
  * \brief Allocate and return an unused RX filter buffer for flow steering.

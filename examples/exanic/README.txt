@@ -4,37 +4,58 @@ ExaNIC example programs
 This directory contains examples of programs which work with the
 libexanic interface.
 
+exanic-rx-frame.c
+-----------------
+Basic example of how to send a frame using the libexanic API.
 
-exanic-benchmarker.c
----------------------
+exanic-tx-frame.c
+-----------------
+Basic example of how to receive a frame using the libexanic API.
 
-This is an example of a benchmarking application written primarily for use with
-ExaNIC HPT*. This tool is designed to allow you to quickly start working with
-the ExaNIC HPT as well as a starting point for writing your own benchmarking
-software. It operates in two modes, cable length estimation mode and system
-measurement mode.
-
-In cable length estimation mode, it can be used to estimate cable lengths where
-the  propagation speeds are known. In system measurement mode, it can be used to
-estimate the delay measured from TX to RX through some device, where both cable
-lengths and propagation delays are known.
-
-The application can also report raw measured values which can be used for
-calibration and high precision benchmarking.
-
-Examples and usage details can be found here:
-https://exablaze.com/docs/exanic/user-guide/x10-hpt/x10-hpt/
-
-
-*Although nothing prevents the application from being used with other devices
-such as the X10/X40.
-
-
+exanic-rx-chunk-inplace.c
+-------------------------
+This is a demonstration of the exanic_receive_chunk_inplace() function. This
+demo tests the ability of the host to receive chunks/frames and reports the
+speed at which they are received.
 
 exanic-tx-preload.c
 -------------------
+This is an example showing how to arbitrarily divide up the ExaNIC TX buffer,
+then load a number of frames into each slot and choose one to send later. The
+idea is to remove the overhead of transferring the packet to the card from the
+critical path.
 
- This is an example showing how to arbitrarily divide up the ExaNIC TX buffer,
- then load a number of frames into each slot and choose one to send later. The
- idea is to remove the overhead of transferring the packet to the card from the
- critical path.
+
+exanic-hpt-fiber-len.c
+----------------------
+This is an example application to show the power of picosecond timestamps which 
+are available using ExaNIC HPT. It demonstrates how to measure fiber/DAC cable 
+lengths to within a few centimeters (inches) accuracy. 
+
+
+exanic-measure.c
+---------------------
+This is an example of a measurement application written primarily for use with 
+ExaNIC HPT (though it can be used with other devices such as the ExaNIC 
+X10/X25/X40/X100).
+
+The application is intended to be used to benchmark external devices with high 
+precision. To use the application:
+1. First measure a device of zero latency (e.g. an optical coupler). This will 
+   give a calibration estimate of the "offset" including cabling delays and 
+   internal NIC delays. The "average" number reported is the result.
+2. Then replace the optical coupler with the device that has an unknown latency 
+   (using the same cables as in step 1) and apply the -O offset parameter, with 
+   the measurement from step 1. Your result will now be high precision, 
+   compensated for cabling delays and NIC internal delays.
+
+
+exanic-benchmarker-stac-t0.c
+----------------------------
+This application works with the stac_t0 FDK example. It performs the
+STAC_T0 latency test as defined by the Securities Technology Analysis Center (STAC).
+It generates UDP datagrams containing random indexes and expects
+echoed indexes to come back in TCP segments from the stack under test,
+in this case an ExaNIC.
+
+Hardware timestamps are taken to calculate the latency in the stack.

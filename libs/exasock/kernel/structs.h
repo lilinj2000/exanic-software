@@ -71,9 +71,6 @@ struct exa_tcp_state
 {
     /* user read-write, kernel read-mostly */
 
-    /* Next send sequence number.
-     * Data must be written to the tx_buffer before send_seq is incremented. */
-    uint32_t send_seq;
     /* Next received sequence number to be delivered to user */
     uint32_t read_seq;
     /* First sequence number beyond the local receive window most recently
@@ -85,9 +82,26 @@ struct exa_tcp_state
      * Valid only when equal to recv_seq. */
     uint32_t dup_acks_seq;
 
-    uint8_t __reserved0[48];
+    /* if the app is killed in the middle of send(),
+     * the driver can see inconsistent states,
+     * e.g. packets made it to the wire but send_seq
+     * is never updated. use this flag to indicate to
+     * the kernel whether to trust our program state */
+    uint8_t tx_consistent;
+
+    uint8_t __reserved0[51];
 
     /* 64 */
+    /* user read-write, kernel read-mostly (non-ATE connections), or
+     * user initialize-read, kernel read-write (ATE-enabled connections) */
+
+    /* Next send sequence number.
+     * Data must be written to the tx_buffer before send_seq is incremented. */
+    uint32_t send_seq;
+
+    uint8_t __reserved1[60];
+
+    /* 128 */
     /* user read-write, kernel not interested */
 
     /* First sequence number beyond the local receive window most recently
@@ -115,9 +129,9 @@ struct exa_tcp_state
         uint8_t seg_count;
     } out_of_order;
 
-    uint8_t __reserved1[7];
+    uint8_t __reserved2[7];
 
-    /* 128 */
+    /* 192 */
     /* either user read-write and kernel read-mostly, or
      * user read-mostly and kernel read-write.
      * Note: In most of scenarios the first case applies. The second
@@ -141,9 +155,9 @@ struct exa_tcp_state
      * the socket's rx_buffer. */
     uint32_t proc_seq;
 
-    uint8_t __reserved2[48];
+    uint8_t __reserved3[48];
 
-    /* 192 */
+    /* 256 */
     /* user read-mostly, kernel read-mostly */
 
     /* Receiver maximum segment size */
@@ -152,30 +166,49 @@ struct exa_tcp_state
     uint8_t wscale;
     /* TCP connection state */
     uint8_t state;
+    /* Keep-alive settings */
+    struct {
+        uint32_t time;
+        uint32_t intvl;
+        uint32_t probes;
+    } keepalive;
+    /* Timeout permissible on sending a TCP segment, in milliseconds. This
+     * is set using the "TCP_USER_TIMEOUT" socket option, at the option
+     * level IPPROTO_TCP. Zero is treated as "unset".
+     *
+     * If a connection times out due to this option, any current or future
+     * syscalls on this socket will fail, and errno will be set to ETIMEDOUT.
+     *
+     * It is checked and enforced in the TCP connection worker only when there
+     * is outstanding (un-ACKed) data.
+     */
+    uint32_t user_timeout_ms;
     /* Slow start after idle? */
     uint8_t ss_after_idle;
 
-    uint8_t __reserved3[59];
+    uint8_t __reserved4[43];
 
-    /* 256 */
+    /* 320 */
     /* user read-mostly, kernel read-write */
 
     /* Congestion window */
     uint32_t cwnd;
     /* Slow start threshold */
     uint32_t ssthresh;
+    /* ATE window limit */
+    uint32_t ate_wnd_end;
 
-    uint8_t __reserved4[56];
+    uint8_t __reserved5[52];
 
-    /* 320 */
+    /* 384 */
     /* user write-mostly, kernel read-write */
 
     /* Set to true to signal that an ACK is needed */
     uint8_t ack_pending;
 
-    uint8_t __reserved5[63];
+    uint8_t __reserved6[63];
 
-    /* 384 */
+    /* 448 */
     /* Stats related info: user initialize, kernel read-write */
 
     struct {

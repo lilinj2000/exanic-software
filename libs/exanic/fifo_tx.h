@@ -15,6 +15,12 @@ extern "C" {
 #endif
 
 /**
+ * \brief Flags that can be passed to \ref exanic_transmit_frame_ex
+ */
+
+#define EXA_FRAME_WARM          (1 << 0)
+
+/**
  * \brief A handle to a ExaNIC TX FIFO
  */
 typedef struct exanic_tx
@@ -36,6 +42,12 @@ typedef struct exanic_tx
 
     struct tx_chunk     *prepared_chunk;
     size_t              prepared_chunk_size;
+
+    /*
+     * whether the chunk returned by \ref exanic_prepare_tx_chunk
+     * should request feedback when sent.
+     */
+    bool                need_feedback;
 } exanic_tx_t;
 
 /**
@@ -89,6 +101,43 @@ int exanic_transmit_frame(exanic_tx_t *tx, const char *frame,
                           size_t frame_size);
 
 /**
+ * \brief Transmit L4 payload through Accelerated TCP Engine
+ *
+ * \param[in]   tx
+ *      A valid TX handle.
+ * \param[in]   connection_id
+ *      ID of the Accelerated TCP Engine to be used for transmit.
+ * \param[in]   type
+ *      The type of payload to transmit.
+ * \param[in]   payload
+ *      Pointer to the user provided buffer.
+ * \param[in]   payload_size
+ *      Size of the payload to transmit.
+ *
+ * \return 0 on success, or -1 on error.
+ */
+int exanic_transmit_payload(exanic_tx_t *tx, uint16_t connection_id,
+                            exanic_tx_type_id_t type, const char *payload,
+                            size_t payload_size);
+
+/**
+ * \brief version of exanic_transmit_frame that takes an addition flag input
+ *
+ * \param[in]   tx
+ *      A valid TX handle.
+ * \param[in]   frame
+ *      Pointer to the user provided buffer.
+ * \param[in]   frame_size
+ *      Size of the frame to transmit.
+ * \param[in]   flags
+ *      Flags to control function behaviour
+ *
+ * \return 0 on success, or -1 on error.
+ */
+int exanic_transmit_frame_ex(exanic_tx_t *tx, const char *frame,
+                             size_t frame_size, uint32_t flags);
+
+/**
  * \brief Allocate space in the TX buffer to start a new frame
  *
  * \param[in]   tx
@@ -112,6 +161,43 @@ char * exanic_begin_transmit_frame(exanic_tx_t *tx, size_t frame_size);
  * \return 0 on success, or -1 on error.
  */
 int exanic_end_transmit_frame(exanic_tx_t *tx, size_t frame_size);
+
+/**
+ * \brief Allocate space in the TX buffer to start a new L4 payload
+ *
+ * \param[in]   tx
+ *      A valid TX handle.
+ * \param[in]   connection_id
+ *      ID of the Accelerated TCP Engine to be used for transmit.
+ * \param[in]   type
+ *      The type of payload to transmit.
+ * \param[in]   payload_size
+ *      Size of the payload to allocate.
+ * \param[out]  csum
+ *      Pointer which will be populated with the address of the payload checksum
+ *      field the caller is supposed to set.
+ *
+ * \return Pointer to the start of the allocated payload
+ */
+char * exanic_begin_transmit_payload(exanic_tx_t *tx, uint16_t connection_id,
+                                     exanic_tx_type_id_t type,
+                                     size_t payload_size, uint16_t **csum);
+
+/**
+ * \brief Transmit a payload that was allocated by \ref exanic_begin_transmit_payload
+ *
+ * \param[in]   tx
+ *      A valid TX handle.
+ * \param[in]   type
+ *      The type of payload to transmit.
+ * \param[in]   frame_size
+ *      Actual size of the payload to allocate, must be smaller than the size
+ *      requested in \ref exanic_begin_transmit_payload
+ *
+ * \return 0 on success, or -1 on error.
+ */
+int exanic_end_transmit_payload(exanic_tx_t* tx, exanic_tx_type_id_t type,
+                                size_t payload_size);
 
 /**
  * \brief Abort a frame that was allocated by \ref exanic_begin_transmit_frame

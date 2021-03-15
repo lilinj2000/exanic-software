@@ -22,6 +22,9 @@
 #include "common.h"
 #include "sys_phc.h"
 
+/* Linux clamps the frequency offset to the range -500ppm to 500ppm */
+#define MAX_FREQ_ADJ 0.0005
+
 
 struct sys_phc_sync_state
 {
@@ -105,7 +108,7 @@ static int set_sys_adj(double adj)
 {
     struct timex tx;
 
-    if (!(LONG_MIN / 65536000000.0 < adj && adj < LONG_MAX / 65536000000.0))
+    if (!(-MAX_FREQ_ADJ <= adj && adj <= MAX_FREQ_ADJ))
     {
         /* adj is out of range or is NaN */
         errno = ERANGE;
@@ -397,10 +400,24 @@ enum sync_status poll_sys_phc_sync(struct sys_phc_sync_state *state)
     /* Set adjustment to compensate for drift and to correct error */
     adj = - drift - med_error_ns /
         (1000000000 * (fast_poll ? SHORT_POLL_INTERVAL : POLL_INTERVAL));
+
+    /* Clamp adjustment to -500ppm .. 500ppm */
+    if (adj < -MAX_FREQ_ADJ)
+        adj = -MAX_FREQ_ADJ;
+    else if (adj > MAX_FREQ_ADJ)
+        adj = MAX_FREQ_ADJ;
+
+    /* Warn if the drift component of the adjustment is too high */
+    if (fabs(drift) > MAX_FREQ_ADJ)
+    {
+        log_printf(LOG_ERR, "%s: System clock drift too large: %.3f ppm",
+                state->name, drift * 1000000);
+    }
+
     if (set_sys_adj(adj) == -1)
     {
         if (!state->error_mode)
-            log_printf(LOG_ERR, "%s: Error adjusting clock: %s",
+            log_printf(LOG_ERR, "%s: Error adjusting system clock: %s",
                     state->name, strerror(errno));
         goto clock_error;
     }

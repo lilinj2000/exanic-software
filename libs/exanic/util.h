@@ -85,6 +85,26 @@ volatile uint32_t *exanic_get_devkit_registers(exanic_t *exanic);
 char *exanic_get_devkit_memory(exanic_t *exanic);
 
 /**
+ * \brief Get the extended devkit registers region.
+ *
+ * \param[in]   exanic
+ *      A valid ExaNIC handle
+ *
+ * \return A pointer to the extended registers on a devkit card.
+ */
+volatile uint32_t *exanic_get_extended_devkit_registers(exanic_t *exanic);
+
+/**
+ * \brief Get the extended devkit memory region.
+ *
+ * \param[in]   exanic
+ *      A valid ExaNIC handle
+ *
+ * \return A pointer to the extended memory region on a devkit card.
+ */
+char *exanic_get_extended_devkit_memory(exanic_t *exanic);
+
+/**
  * \brief Check if a devkit image is a time limited demo version.
  *
  * \param[in]   exanic
@@ -93,6 +113,33 @@ char *exanic_get_devkit_memory(exanic_t *exanic);
  * \return 1 if image is a demo version, 0 otherwise.
  */
 int exanic_is_devkit_demo(exanic_t *exanic);
+
+/**
+ * \brief Check if a devkit image has been built with a free version of the devkit.
+ *
+ * \param[in]   exanic
+ *      A valid ExaNIC handle
+ *
+ * \return 1 if image was built with a free devkit, 0 otherwise.
+ */
+int exanic_is_devkit_free(exanic_t *exanic);
+
+/**
+ * \brief Return the sysfs path of an ExaNIC device
+ *
+ * \param[in]   exanic
+ *      A valid ExaNIC handle
+ *
+ * \param[out]  buf
+ *      Destination buffer
+ *
+ * \param[in]   len
+ *      Size of buf
+ *
+ * \return Length of sysfs path string if successful, -1 otherwise
+ */
+int exanic_get_sysfs_path(exanic_t *exanic, char *buf, size_t len);
+
 
 #ifdef __cplusplus
 }

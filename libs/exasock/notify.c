@@ -32,6 +32,8 @@ exa_notify_kern_epoll_add(struct exa_notify * restrict no,
 {
     int fd = exa_socket_fd(sock);
 
+    assert(exa_write_locked(&sock->lock));
+
     exa_lock(&no->ep.lock);
     if (no->ep.ref_cnt++ == 0)
     {
@@ -43,8 +45,11 @@ exa_notify_kern_epoll_add(struct exa_notify * restrict no,
     }
     exa_unlock(&no->ep.lock);
 
-    return exa_sys_epoll_ctl(no->ep.fd, EXASOCK_EPOLL_CTL_ADD, fd,
-                             &sock->bind.ip);
+    if (exa_sys_epoll_ctl(no->ep.fd, EXASOCK_EPOLL_CTL_ADD, fd) < 0)
+        return -1;
+
+    sock->kern_epoll_member = true;
+    return 0;
 
 err_mmap:
     exa_sys_epoll_close(no->ep.fd);
@@ -60,11 +65,13 @@ exa_notify_kern_epoll_del(struct exa_notify * restrict no,
 {
     int ret;
 
-    ret = exa_sys_epoll_ctl(no->ep.fd, EXASOCK_EPOLL_CTL_DEL, fd,
-                            &sock->bind.ip);
+    assert(exa_write_locked(&sock->lock));
+
+    ret = exa_sys_epoll_ctl(no->ep.fd, EXASOCK_EPOLL_CTL_DEL, fd);
     if (ret != 0)
         return ret;
 
+    sock->kern_epoll_member = false;
     exa_lock(&no->ep.lock);
 
     no->ep.ref_cnt--;
@@ -139,7 +146,7 @@ exa_notify_free(struct exa_notify * restrict no)
 void
 exa_notify_udp_init(struct exa_socket * restrict sock)
 {
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
     assert(sock->domain == AF_INET);
     assert(sock->type == SOCK_DGRAM);
 
@@ -160,7 +167,7 @@ exa_notify_udp_init(struct exa_socket * restrict sock)
 void
 exa_notify_tcp_init(struct exa_socket * restrict sock)
 {
-    assert(sock->bypass);
+    assert(sock->bypass_state == EXA_BYPASS_ACTIVE);
     assert(sock->domain == AF_INET);
     assert(sock->type == SOCK_STREAM);
 
@@ -197,8 +204,9 @@ exa_notify_insert_sock(struct exa_notify * restrict no,
 
     /* Check if exasock kernel epoll instance needs to be created
      * and/or updated */
-    if (sock->bypass && sock->domain == AF_INET && sock->type == SOCK_STREAM &&
-        exanic_tcp_listening(sock))
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE
+        && sock->domain == AF_INET
+        && sock->type == SOCK_STREAM)
     {
         int ret = exa_notify_kern_epoll_add(no, sock);
         if (ret != 0)
@@ -227,7 +235,7 @@ exa_notify_insert_sock(struct exa_notify * restrict no,
         no->fd_table[tail].list_next = fd;
     }
 
-    if (sock->bypass)
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE)
     {
         /* Inserting a ready socket is considered to be an edge */
         if (sock->rx_ready)
@@ -239,7 +247,7 @@ exa_notify_insert_sock(struct exa_notify * restrict no,
     }
 
     exa_lock(&no->fd_cnt.lock);
-    if (sock->bypass)
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE)
         no->fd_cnt.bypass++;
     else
         no->fd_cnt.native++;
@@ -269,7 +277,7 @@ exa_notify_modify_sock(struct exa_notify * restrict no,
 
     no->fd_table[fd].events = events;
 
-    if (sock->bypass)
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE)
     {
         /* Trigger an edge if the socket is ready */
         if (sock->rx_ready)
@@ -301,6 +309,17 @@ exa_notify_remove_sock(struct exa_notify * restrict no,
         return -1;
     }
 
+    /* Check if exasock kernel epoll instance needs to be updated/closed */
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE
+        && sock->domain == AF_INET
+        && sock->type == SOCK_STREAM
+        && sock->kern_epoll_member)
+    {
+        int ret = exa_notify_kern_epoll_del(no, sock, fd);
+        if (ret != 0)
+            return ret;
+    }
+
     sock->notify_parent = NULL;
     no->fd_table[fd].events = 0;
     no->fd_table[fd].present = false;
@@ -327,13 +346,8 @@ exa_notify_remove_sock(struct exa_notify * restrict no,
     /* Remove the socket from the maybe-ready queue */
     exa_notify_queue_remove(no, fd);
 
-    /* Check if exasock kernel epoll instance needs to be updated/closed */
-    if (sock->bypass && sock->domain == AF_INET && sock->type == SOCK_STREAM &&
-        exanic_tcp_listening(sock))
-        return exa_notify_kern_epoll_del(no, sock, fd);
-
     exa_lock(&no->fd_cnt.lock);
-    if (sock->bypass)
+    if (sock->bypass_state == EXA_BYPASS_ACTIVE)
         no->fd_cnt.bypass--;
     else
         no->fd_cnt.native--;

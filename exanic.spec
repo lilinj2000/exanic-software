@@ -1,5 +1,5 @@
 Name:           exanic
-Version:        2.1.1-git
+Version:        2.6.0-git
 Release:        1%{?dist}
 
 Summary:        ExaNIC drivers and software
@@ -19,9 +19,9 @@ exanic-utils and exanic-devel.
 Summary:        ExaNIC network driver
 Group:          System Environment/Kernel
 %if 0%{?suse_version}
-Requires:       dkms, kernel-source
+Requires:       dkms, kernel-source, make
 %else
-Requires:       dkms, kernel-devel
+Requires:       dkms, kernel-devel, make
 %endif
 BuildArch:      noarch
 %description dkms
@@ -43,7 +43,7 @@ It also contains the ExaNIC Sockets wrapper (exasock) and its utilities
 %package devel
 Summary:        ExaNIC development library
 Group:          Development/Libraries
-%description devel 
+%description devel
 This package contains libexanic, a low-level access library for the
 ExaNIC.  It can be used to write applications which transmit and receive
 raw Ethernet packets with minimum possible latency.
@@ -60,10 +60,13 @@ test "%{buildroot}" != "/" && rm -rf %{buildroot}
 make install-bin BINDIR=%{buildroot}%{_bindir} LIBDIR=%{buildroot}%{_libdir} INCDIR=%{buildroot}%{_includedir}
 
 # Package up required files to build modules
-mkdir -p %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exanic %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exasock/kernel
+mkdir -p %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exanic %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exasock/kernel \
+         %{buildroot}/usr/src/%{name}-%{version}-%{release}/include
 cp -r modules %{buildroot}/usr/src/%{name}-%{version}-%{release}/
-cp libs/exanic/{ioctl.h,pcie_if.h,fifo_if.h,const.h} %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exanic
-cp libs/exasock/kernel/{api.h,structs.h,consts.h} %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exasock/kernel
+cp libs/exanic/{ioctl.h,pcie_if.h,fifo_if.h,const.h,checksum*.h,hw_info.h} %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exanic
+cp libs/exasock/kernel/{api.h,structs.h,consts.h,exasock-bonding.h} %{buildroot}/usr/src/%{name}-%{version}-%{release}/libs/exasock/kernel
+cp include/exanic_version.h %{buildroot}/usr/src/%{name}-%{version}-%{release}/include
+
 
 # Create a dkms.conf
 cat >%{buildroot}/usr/src/%{name}-%{version}-%{release}/dkms.conf <<EOF
@@ -97,7 +100,7 @@ dkms remove -m %{name} -v %{version}-%{release} --all --rpm_safe_upgrade
 
 %files
 %defattr(-,root,root,-)
-%doc LICENSE.txt changelog.txt docs/README.txt
+%doc LICENSE.txt RELEASE-NOTES.txt docs/README.txt
 
 %files dkms
 %defattr(-,root,root,-)

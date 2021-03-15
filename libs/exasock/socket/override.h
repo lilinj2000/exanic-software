@@ -1,6 +1,10 @@
 #ifndef EXASOCK_SOCKET_OVERRIDE_H
 #define EXASOCK_SOCKET_OVERRIDE_H
 
+#ifdef MSG_WAITFORONE
+#define HAVE_RECVMMSG
+#endif
+
 extern int (*__libc_socket)(int, int, int);
 extern int (*__libc_close)(int);
 extern int (*__libc_bind)(int, const struct sockaddr *, socklen_t);
@@ -26,6 +30,8 @@ extern ssize_t (*__libc_send)(int, const void *, size_t, int);
 extern ssize_t (*__libc_sendto)(int, const void *, size_t, int,
                                 const struct sockaddr *, socklen_t);
 extern ssize_t (*__libc_sendmsg)(int, const struct msghdr *, int);
+extern int (*__libc_sendmmsg)(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
+                              int flags);
 extern ssize_t (*__libc_read)(int, void *, size_t);
 extern ssize_t (*__libc_readv)(int, const struct iovec *iov, int iovcnt);
 extern ssize_t (*__libc_read_chk)(int, void *, size_t, size_t);
@@ -48,6 +54,13 @@ extern int (*__libc_epoll_ctl)(int, int, int, struct epoll_event *);
 extern int (*__libc_epoll_wait)(int, struct epoll_event *, int, int);
 extern int (*__libc_epoll_pwait)(int, struct epoll_event *, int, int,
                                  const sigset_t *);
+#ifdef HAVE_RECVMMSG
+extern int (*__libc_recvmmsg)(int, struct mmsghdr *, unsigned int, int,
+#if RECVMMSG_HAS_CONST_TIMESPEC
+                              const
+#endif
+                              struct timespec *);
+#endif
 
 void __exasock_override_init(void);
 
@@ -57,6 +70,7 @@ extern bool __thread signal_received;
 extern bool __thread signal_interrupted;
 
 extern bool __thread override_disabled;
+extern bool __thread override_unsafe;
 extern bool __override_initialized;
 
 #define LIBC(func, ...)                 \

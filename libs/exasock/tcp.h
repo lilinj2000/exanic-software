@@ -1,7 +1,10 @@
 #ifndef EXASOCK_TCP_H
 #define EXASOCK_TCP_H
 
-#define EXA_TCP_RETRANSMIT_NS 1000000000
+#define EXA_TCP_SS_AFTER_IDLE_DEF       0
+#define EXA_TCP_KEEPALIVE_INTVL_DEF     75
+#define EXA_TCP_KEEPALIVE_PROBES_DEF    9
+#define EXA_TCP_KEEPALIVE_TIME_DEF      7200
 
 extern struct exa_hashtable __exa_tcp_sockfds;
 
@@ -32,15 +35,17 @@ exa_tcp_conn_cleanup(struct exa_tcp_conn * restrict ctx)
 {
 }
 
-/* Calculate the size of the largest packet that can be sent right now,
- * allowing for TCP state, receive window, congestion window and MSS
- * Also retrieves the current send sequence number */
+/* Calculate the size of the largest segment that can be sent right now,
+ * allowing for TCP state, receive window, congestion window and MSS.
+ * In case of ATE offloaded connections the most recently updated ATE window
+ * limit is used. Also retrieves the current send sequence number. */
 static inline int
-exa_tcp_max_pkt_len(struct exa_tcp_conn * restrict ctx,
+exa_tcp_max_seg_len(struct exa_tcp_conn * restrict ctx, bool is_ate,
                     uint32_t * restrict seq, size_t * restrict len)
 {
     struct exa_tcp_state * restrict state = &ctx->state->p.tcp;
-    uint32_t unacked_len, window_size, rwnd;
+    uint32_t wnd_end;
+    int32_t wnd_space;
 
     if (state->state != EXA_TCP_ESTABLISHED &&
         state->state != EXA_TCP_CLOSE_WAIT)
@@ -51,16 +56,25 @@ exa_tcp_max_pkt_len(struct exa_tcp_conn * restrict ctx,
 
     *seq = state->send_seq;
 
-    unacked_len = state->send_seq - state->send_ack;
-    rwnd = state->rwnd_end - state->send_ack;
-    window_size = rwnd < state->cwnd ? rwnd : state->cwnd;
+    if (!is_ate)
+    {
+        uint32_t cwnd_end = state->send_ack + state->cwnd;
+        uint32_t rwnd_end = state->rwnd_end;
+        wnd_end = seq_compare(cwnd_end, rwnd_end) < 0 ? cwnd_end : rwnd_end;
+    }
+    else
+    {
+        wnd_end = ntohl(state->ate_wnd_end);
+    }
 
-    if (window_size < unacked_len)
+    wnd_space = wnd_end - *seq;
+
+    if (wnd_space < 0)
         *len = 0;
-    else if (state->rmss < window_size - unacked_len)
+    else if (state->rmss < wnd_space)
         *len = state->rmss;
     else
-        *len = window_size - unacked_len;
+        *len = (size_t)wnd_space;
 
     return 0;
 }
@@ -102,32 +116,30 @@ exa_tcp_listening(struct exa_tcp_conn * restrict ctx)
 }
 
 /* Generate initial sequence number for a new connection */
-static inline uint32_t
-exa_tcp_init_seq(void)
+int exa_sys_get_isn(int fd, uint32_t *isn);
+
+static inline int
+exa_tcp_init_seq(int fd, uint32_t *isn)
 {
-    struct timespec tv;
-    uint32_t seq;
-
-    /* Use the current time as the initial sequence number */
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &tv);
-    seq = tv.tv_sec * 1000000000ULL + tv.tv_nsec;
-
-    /* TODO: Randomise the sequence number in a secure way */
-
-    return seq;
+    return exa_sys_get_isn(fd, isn);
 }
 
-static inline void
-exa_tcp_state_init_conn(struct exa_socket_state * restrict state)
+static inline int
+exa_tcp_state_init_conn(int fd, struct exa_socket_state * restrict state)
 {
     struct exa_tcp_state * restrict tcp = &state->p.tcp;
+    uint32_t isn = 0;
+    int ret = 0;
+    if ((ret = exa_tcp_init_seq(fd, &isn)))
+        return ret;
 
     /* Generate initial sequence number */
-    tcp->send_ack = tcp->send_seq = exa_tcp_init_seq();
+    tcp->send_ack = tcp->send_seq = isn;
     tcp->rwnd_end = tcp->send_ack;
 
     /* Initialize stats */
     tcp->stats.init_send_seq = tcp->send_seq;
+    return 0;
 }
 
 static inline void
@@ -382,7 +394,7 @@ exa_tcp_build_ctrl(struct exa_tcp_conn * restrict ctx, char ** restrict hdr,
 
     case EXA_TCP_CLOSING:
         /* Send ACK for remote FIN */
-        h->th_seq = htonl(state->send_seq);
+        h->th_seq = htonl(state->send_seq + 1);
         h->th_ack = htonl(recv_seq + 1);
         h->th_flags = TH_ACK;
         break;
@@ -518,22 +530,26 @@ exa_tcp_parse_hdr(char *hdr, char *read_end, size_t pkt_len, uint64_t addr_csum,
                   uint64_t * restrict csum)
 {
     const struct tcphdr * restrict h = (struct tcphdr *)hdr;
+    size_t hdr_len = h->th_off * 4;
 
     if ((read_end - hdr) < sizeof(struct tcphdr))
         return -1;
 
-    if (pkt_len < sizeof(struct tcphdr))
+    if (hdr_len < sizeof(struct tcphdr))
+        return -1;
+
+    if (pkt_len < hdr_len)
         return -1;
 
     /* Calculate checksum of pseudo-header and header */
-    *csum = csum_part(hdr, h->th_off * 4,
+    *csum = csum_part(hdr, hdr_len,
                       addr_csum + htons(IPPROTO_TCP) + htons(pkt_len));
 
     /* Beginning of data in header chunk */
-    *data_begin = hdr + (h->th_off * 4);
+    *data_begin = hdr + hdr_len;
 
     /* TCP segment info */
-    *data_len = pkt_len - (h->th_off * 4);
+    *data_len = pkt_len - hdr_len;
     *data_seq = ntohl(h->th_seq) + ((h->th_flags & TH_SYN) ? 1 : 0);
 
     /* Other header info */
@@ -542,7 +558,7 @@ exa_tcp_parse_hdr(char *hdr, char *read_end, size_t pkt_len, uint64_t addr_csum,
     *win = ntohs(h->th_win);
 
     /* TCP options region */
-    *tcpopt_len = (h->th_off * 4) - sizeof(struct tcphdr);
+    *tcpopt_len = hdr_len - sizeof(struct tcphdr);
     *tcpopt = (uint8_t *)(hdr + sizeof(struct tcphdr));
 
     port->peer = h->th_sport;
@@ -580,12 +596,22 @@ exa_tcp_apply_syn_opts(struct exa_tcp_conn * restrict ctx,
         {
         case TCPOPT_MAXSEG:
             state->rmss = ((uint16_t)tcpopt[i + 2] << 8) | tcpopt[i + 3];
+            if (state->rmss > EXA_TCP_MSS)
+                state->rmss = EXA_TCP_MSS;
             break;
         case TCPOPT_WINDOW:
             state->wscale = tcpopt[i + 2];
             break;
         }
     }
+}
+
+static inline void
+exa_tcp_error_close(struct exa_tcp_conn * restrict ctx, int error)
+{
+    struct exa_tcp_state * restrict state = &ctx->state->p.tcp;
+    ctx->state->error = error;
+    state->state = EXA_TCP_CLOSED;
 }
 
 /* Drop packets which are not valid for the current state
@@ -670,13 +696,14 @@ exa_tcp_update_state(struct exa_tcp_conn * restrict ctx, uint8_t flags,
      *        A reset is valid if its sequence number is in the window. */
     if ((flags & TH_RST) && seq_compare(data_seq, state->recv_seq) <= 0)
     {
+        int err;
         /* Connection reset, move to CLOSED state */
         if (state->state == EXA_TCP_SYN_SENT)
-            ctx->state->error = ECONNREFUSED;
+            err = ECONNREFUSED;
         else
-            ctx->state->error = ECONNRESET;
+            err = ECONNRESET;
 
-        state->state = EXA_TCP_CLOSED;
+        exa_tcp_error_close(ctx, err);
 
         /* TODO: Flush send and receive buffers */
 
@@ -687,11 +714,14 @@ exa_tcp_update_state(struct exa_tcp_conn * restrict ctx, uint8_t flags,
         state->ack_pending = true;
 }
 
-static inline void
+/* Returns true if a new connection has just been established */
+static inline bool
 exa_tcp_update_conn_state(struct exa_tcp_conn * restrict ctx, uint8_t flags,
                           uint32_t data_seq, size_t len)
 {
     volatile struct exa_tcp_state *state = &ctx->state->p.tcp;
+    bool fw1_fin = false, fw1_ack = false;
+    bool new_conn = false;
 
 update_state:
     switch (state->state)
@@ -703,6 +733,7 @@ update_state:
             /* Got SYN ACK */
             state->state = EXA_TCP_ESTABLISHED;
             state->ack_pending = true;
+            new_conn = true;
         }
         else if ((flags & (TH_SYN | TH_ACK)) == TH_SYN)
         {
@@ -719,6 +750,7 @@ update_state:
         {
             /* Connection established */
             state->state = EXA_TCP_ESTABLISHED;
+            new_conn = true;
         }
         break;
 
@@ -736,8 +768,22 @@ update_state:
         break;
 
     case EXA_TCP_FIN_WAIT_1:
-        if ((flags & TH_FIN) &&
-            seq_compare(data_seq + len, state->recv_seq) <= 0)
+
+        fw1_fin = ((flags & TH_FIN) &&
+                  seq_compare(data_seq + len, state->recv_seq) <= 0);
+        fw1_ack = ((flags & TH_ACK) &&
+                  seq_compare(state->send_seq, state->send_ack) < 0);
+
+        if (fw1_fin && fw1_ack)
+        {
+            /* Received ACK for our FIN, remote peer is also closed */
+            if (!__sync_bool_compare_and_swap(&state->state,
+                                              EXA_TCP_FIN_WAIT_1,
+                                              EXA_TCP_TIME_WAIT))
+                goto update_state;
+            state->ack_pending = true;
+        }
+        else if (fw1_fin)
         {
             /* Simultaneous close */
             if (!__sync_bool_compare_and_swap(&state->state,
@@ -746,8 +792,7 @@ update_state:
                 goto update_state;
             state->ack_pending = true;
         }
-        else if ((flags & TH_ACK) &&
-                 seq_compare(state->send_seq, state->send_ack) < 0)
+        else if (fw1_ack)
         {
             /* Received ACK for our FIN, but remote peer is not closed */
             if (!__sync_bool_compare_and_swap(&state->state,
@@ -781,6 +826,14 @@ update_state:
         }
         break;
 
+    case EXA_TCP_CLOSE_WAIT:
+        if ((flags & TH_FIN) &&
+            seq_compare(data_seq + len, state->recv_seq) <= 0)
+        {
+            state->ack_pending = true;
+        }
+        break;
+
     case EXA_TCP_LAST_ACK:
         if ((flags & TH_ACK) &&
             seq_compare(state->send_seq, state->send_ack) < 0)
@@ -792,6 +845,7 @@ update_state:
         }
         break;
     }
+    return new_conn;
 }
 
 #endif /* EXASOCK_TCP_H */

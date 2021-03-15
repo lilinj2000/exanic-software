@@ -151,11 +151,25 @@ __recv_block_tcp_ready(struct exa_socket * restrict sock, int *ret,
         *ret = -1;
         return true;
     }
-    else if (*len1 > 0 || *len2 > 0 || exa_tcp_rx_buffer_eof(sock) ||
-             sock->state->rx_shutdown)
+    else if (*len1 > 0 || *len2 > 0 || sock->state->rx_shutdown)
     {
         *ret = 0;
         return true;
+    }
+    else if (exa_tcp_rx_buffer_eof(sock))
+    {
+        if (sock->state->error == ETIMEDOUT &&
+            sock->state->p.tcp.state == EXA_TCP_CLOSED)
+        {
+            errno = sock->state->error;
+            *ret = -1;
+            return true;
+        }
+        else
+        {
+            *ret = 0;
+            return true;
+        }
     }
     exa_unlock(&sock->state->rx_lock);
     return false;
@@ -327,7 +341,7 @@ recv(int sockfd, void *buf, size_t len, int flags)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, sockfd);
             exa_read_unlock(&sock->lock);
@@ -368,7 +382,7 @@ __recv_chk(int sockfd, void *buf, size_t len, size_t buflen, int flags)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, sockfd);
             exa_read_unlock(&sock->lock);
@@ -408,7 +422,7 @@ recvfrom(int sockfd, void *buf, size_t len, int flags,
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, sockfd);
             exa_read_unlock(&sock->lock);
@@ -453,7 +467,7 @@ __recvfrom_chk(int sockfd, void *buf, size_t len, size_t buflen,
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, sockfd);
             exa_read_unlock(&sock->lock);
@@ -707,7 +721,7 @@ recvmsg(int sockfd, struct msghdr *msg, int flags)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, sockfd);
             exa_read_unlock(&sock->lock);
@@ -827,7 +841,7 @@ read(int fd, void *buf, size_t count)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, fd);
             exa_read_unlock(&sock->lock);
@@ -867,7 +881,7 @@ __read_chk(int fd, void *buf, size_t nbytes, size_t buflen)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, fd);
             exa_read_unlock(&sock->lock);
@@ -978,7 +992,7 @@ readv(int fd, const struct iovec *iov, int iovcnt)
     {
         exa_read_lock(&sock->lock);
 
-        if (!sock->bypass)
+        if (sock->bypass_state != EXA_BYPASS_ACTIVE)
         {
             print_warning(sock, fd);
             exa_read_unlock(&sock->lock);
@@ -997,3 +1011,118 @@ readv(int fd, const struct iovec *iov, int iovcnt)
 
     return ret;
 }
+
+#ifdef HAVE_RECVMMSG
+__attribute__((visibility("default")))
+int
+recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
+         int flags,
+#if RECVMMSG_HAS_CONST_TIMESPEC
+         const
+#endif
+         struct timespec *timeout)
+{
+    struct exa_socket *restrict sock = exa_socket_get(sockfd);
+    struct timespec t_max, t_now;
+    int ret = 0;
+    unsigned int i = 0;
+
+    TRACE_CALL("recvmmsg");
+    TRACE_ARG(INT, sockfd);
+    TRACE_FLUSH();
+
+    if (sock == NULL)
+    {
+        ret = LIBC(recvmmsg, sockfd, msgvec, vlen, flags, timeout);
+        goto out;
+    }
+
+    if (timeout != NULL)
+    {
+        if (!ts_vld(timeout))
+        {
+            errno = EINVAL;
+            ret = -1;
+            goto out;
+        }
+
+        /* configure timeout */
+        if (clock_gettime(CLOCK_MONOTONIC_COARSE, &t_max) == -1)
+        {
+            errno = EAGAIN;
+            ret = -1;
+            goto out;
+        }
+        ts_add(&t_max, timeout);
+    }
+
+    if (sock->bypass_state != EXA_BYPASS_ACTIVE)
+    {
+        print_warning(sock, sockfd);
+        ret = LIBC(recvmmsg, sockfd, msgvec, vlen, flags, timeout);
+        goto out;
+    }
+
+    exa_read_lock(&sock->lock);
+    for (i = 0; i < vlen; i++)
+    {
+        ret = recvmsg_bypass(sock, sockfd, &msgvec[i].msg_hdr,
+                             flags & ~MSG_WAITFORONE);
+        if (ret == -1)
+        {
+            /*
+             * Per Linux behaviour, if at least one message has been received when
+             * an error occurs, return it.  If some permanent error has occurred
+             * such as the socket no longer being valid, this error will be returned
+             * on the next call to recvmmsg.
+             */
+            if (i > 0)
+                ret = i;
+            goto out_unlock;
+        }
+
+        msgvec[i].msg_len = ret;
+        ret = i + 1;
+
+        /* check timeout */
+        if (timeout != NULL)
+        {
+            if (clock_gettime(CLOCK_MONOTONIC_COARSE, &t_now) == -1)
+            {
+                errno = EAGAIN;
+                ret = -1;
+                goto out_unlock;
+            }
+
+            /*
+             * Stripping the const-ness of this timespec is a little nasty, but
+             * Linux does not define it as const (see net/socket.c), and changes the
+             * pointee (by setting it to how far away you were from the timeout).
+             *
+             * This is fine so far, but glibc versions before 2.24 define the
+             * timespec as const - so, to maintain compatibility, we declare it as
+             * const and cast it away here.
+             */
+            ts_sub(&t_max, &t_now, (struct timespec*)timeout);
+
+            if (ts_after_eq(&t_now, &t_max))
+                goto out_unlock;
+        }
+
+        if (flags & MSG_WAITFORONE)
+            flags |= MSG_DONTWAIT;
+    }
+
+ out_unlock:
+    exa_read_unlock(&sock->lock);
+
+ out:
+    TRACE_ARG(MMSG_PTR, msgvec, ret);
+    TRACE_ARG(UNSIGNED, vlen);
+    TRACE_ARG(BITS, flags, msg_flags);
+    TRACE_LAST_ARG(TIMESPEC_PTR, timeout);
+    TRACE_RETURN(INT, ret);
+
+    return ret;
+}
+#endif

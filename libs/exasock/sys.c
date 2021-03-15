@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -96,7 +97,7 @@ __exasock_sys_init()
 void
 exa_sys_dst_queue(in_addr_t dst_addr, in_addr_t src_addr, char *hdr,
                   size_t hdr_len, const struct iovec * restrict iov,
-                  size_t iovcnt, size_t skip_len, size_t data_len)
+                  size_t iovcnt, size_t skip_len, size_t data_len, bool warm)
 {
     struct exasock_dst_request req;
     char buf[MAX_MSG_SIZE];
@@ -131,7 +132,10 @@ exa_sys_dst_queue(in_addr_t dst_addr, in_addr_t src_addr, char *hdr,
     req.dst_addr = dst_addr;
     req.src_addr = src_addr;
     req.ip_packet = buf;
-    req.ip_packet_len = hdr_len + offs;
+    if (EXPECT_TRUE(!warm))
+        req.ip_packet_len = hdr_len + offs;
+    else
+        req.ip_packet_len = 0;
 
     exasock_override_off();
     ioctl(exasock_fd, EXASOCK_IOCTL_DST_QUEUE, &req);
@@ -463,8 +467,7 @@ exa_sys_epoll_munmap(int fd, struct exasock_epoll_state **state)
 }
 
 int
-exa_sys_epoll_ctl(int epfd, enum exasock_epoll_ctl_op op, int fd,
-                  struct exa_endpoint * restrict endpoint)
+exa_sys_epoll_ctl(int epfd, enum exasock_epoll_ctl_op op, int fd)
 {
     struct exasock_epoll_ctl_request req;
     int ret;
@@ -472,12 +475,58 @@ exa_sys_epoll_ctl(int epfd, enum exasock_epoll_ctl_op op, int fd,
     memset(&req, 0, sizeof(req));
     req.op = op;
     req.fd = fd;
-    req.local_addr = endpoint->addr.local;
-    req.local_port = endpoint->port.local;
 
     exasock_override_off();
     ret = ioctl(epfd, EXASOCK_IOCTL_EPOLL_CTL, &req);
     exasock_override_on();
 
     return ret;
+}
+
+int
+exa_sys_ate_enable(int fd, int ate_id)
+{
+    int ret;
+
+    exasock_override_off();
+    ret = ioctl(fd, EXASOCK_IOCTL_ATE_ENABLE, &ate_id);
+    exasock_override_on();
+
+    return ret;
+}
+
+int
+exa_sys_ate_init(int fd)
+{
+    int ret;
+
+    exasock_override_off();
+    ret = ioctl(fd, EXASOCK_IOCTL_ATE_INIT, NULL);
+    exasock_override_on();
+
+    return ret;
+}
+
+int
+exa_sys_get_isn(int fd, uint32_t *isn)
+{
+    int ret;
+
+    exasock_override_off();
+    ret = ioctl(fd, EXASOCK_IOCTL_ISN_ALLOC, isn);
+    exasock_override_on();
+
+    return ret;
+}
+
+pid_t
+exa_sys_get_tid()
+{
+#ifdef SYS_gettid
+    return syscall(SYS_gettid);
+#else
+#warning "gettid system call is unavailable!"
+#warning "exasock trace output will not look correct."
+    return getpid();
+#endif
 }

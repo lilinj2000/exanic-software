@@ -16,6 +16,11 @@
 #include <linux/file.h>
 #include <net/checksum.h>
 #include <net/tcp.h>
+#if __HAS_SIPHASH
+#include <linux/siphash.h>
+#else
+#include "exasock-siphash.h"
+#endif
 
 #include "../../libs/exasock/kernel/api.h"
 #include "../../libs/exasock/kernel/consts.h"
@@ -25,9 +30,26 @@
 #include "exasock.h"
 #include "exasock-stats.h"
 
+/**
+ * Module command line parameters
+ */
+static int ate_win_limit_off;
+module_param(ate_win_limit_off, int, 0);
+MODULE_PARM_DESC(ate_win_limit_off, "Disable TCP window limitation in ATE");
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 9, 0)
 #define __HAS_OLD_HLIST_ITERATOR
 #define __HAS_OLD_NET_RANDOM
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+#define __GETNAME_NO_SOCKLEN_PARAM
+#endif
+
+/* Linux v5.9+ introduces a sockptr_t type and the constructor function
+ * USER_SOCKPTR(p), prior to this setsockopt() accepts a pointer directly */
+#ifndef _LINUX_SOCKPTR_H
+#define USER_SOCKPTR(p) (p)
 #endif
 
 struct exasock_tcp_conn_counters
@@ -64,6 +86,24 @@ struct exasock_tcp_counters
         struct exasock_tcp_conn_counters    conn;
         struct exasock_tcp_listen_counters  listen;
     } s;
+};
+
+struct exasock_ate
+{
+    int                 id;
+    struct net_device   *ndev;
+    bool                active;
+/* the ate session is being drained, no more
+ * data may be sent through payload injection */
+    bool                tx_disabled;
+/* wait queue for the SW to wait for mirrored
+ * segments to be sent from HW */
+    wait_queue_head_t   mirror_wtq;
+/* the most recent mirrored sequence number
+ * from HW */
+    uint32_t            last_mirror_seq;
+    size_t              last_mirror_len;
+    bool                echo_rcvd;
 };
 
 /* Element of the list of received segments */
@@ -105,6 +145,9 @@ struct exasock_tcp
     uint32_t                        last_send_seq;
     uint32_t                        last_send_ack;
 
+    /* Number of times the last seen ACK hasn't changed */
+    uint32_t                        last_ack_counter;
+
     /* Last advertised window */
     struct
     {
@@ -127,6 +170,8 @@ struct exasock_tcp
 
     /* Retransmit timeout is triggered when count reaches 0 */
     int                             retransmit_countdown;
+    /* Exit timewait state when count reaches 0 */
+    int                             timewait_countdown;
 
     /* Received duplicate acks state. Used for entering fast retransmit. */
     struct
@@ -140,17 +185,32 @@ struct exasock_tcp
     bool                            fast_retransmit;
     uint32_t                        fast_retransmit_recover_seq;
 
+    /* Keep-alive counters */
+    struct
+    {
+        unsigned                    timer;
+        unsigned                    probe_cnt;
+    } keepalive;
+
     struct delayed_work             work;
 
     /* Window space availability monitoring */
     struct delayed_work             win_work;
     unsigned                        win_work_on;
 
+    /* fin handshake and garbage collection work */
+    struct delayed_work             fin_work;
+    struct delayed_work             gc_work;
+    /* list node for queueing on the tw death row */
+    struct list_head                death_link;
+
     struct hlist_node               hash_node;
     bool                            dead_node;
 
-    struct exasock_epoll_notify *   notify;
-    spinlock_t                      notify_lock;
+    struct exasock_epoll_notify     notify;
+
+    /* TCP Accelerated TCP Engine */
+    struct exasock_ate              ate;
 
     struct kref                     refcount;
     /* Semaphore stays down until refcount goes to 0 */
@@ -159,11 +219,23 @@ struct exasock_tcp
     /* Statistics related structures */
     struct exasock_tcp_counters     counters;
     struct exasock_stats_sock       stats;
+
+    /* user has called close() on this connection */
+    bool                            user_closed;
+
+    /* the final ack lost during timewait */
+    bool                            timewait_dupfin;
+
+    /* whether a reset should be sent on exasock_tcp_free() */
+    bool                            reset_on_free;
 };
 
 struct exasock_tcp_req
 {
     unsigned long               timestamp;
+
+    /* number of syn-ack retransmissions attempted */
+    unsigned                    synack_attempts;
 
     uint32_t                    local_addr;
     uint32_t                    peer_addr;
@@ -186,12 +258,28 @@ static DEFINE_SPINLOCK(         tcp_bucket_lock);
 
 static struct sk_buff_head      tcp_packets;
 static struct workqueue_struct *tcp_workqueue;
+/* for running deferred calls to exasock_tcp_gc_worker() */
+static struct workqueue_struct *tcp_gc_workqueue;
 static struct delayed_work      tcp_rx_work;
 
 static struct hlist_head *      tcp_req_buckets;
 static LIST_HEAD(               tcp_req_list);
 static DEFINE_SPINLOCK(         tcp_req_lock);
 static struct delayed_work      tcp_req_work;
+/*
+ * list of tcp sessions that have been closed by the user
+ * but pending cleanup
+ */
+static LIST_HEAD(               tcp_wait_death_list);
+static DEFINE_SPINLOCK(         tcp_wait_death_lock);
+/*
+ * random key for generating initial sequence numbers,
+ * initialised once and lives until driver unloaded
+ */
+static siphash_key_t            tcp_secret;
+
+static struct sk_buff_head      ate_packets;
+static struct work_struct       ate_skb_proc_work;
 
 #define RX_BUFFER_SIZE          1048576
 #define RX_BUFFER_MASK          (RX_BUFFER_SIZE - 1)
@@ -201,16 +289,27 @@ static struct delayed_work      tcp_req_work;
 #define NUM_BUCKETS             4096
 
 /* Timer fires once every 250ms */
-#define TCP_TIMER_JIFFIES       (HZ / 4)
+#define TCP_TIMER_PER_SEC       4
+#define TCP_TIMER_JIFFIES       (HZ / TCP_TIMER_PER_SEC)
 
 /* Number of timer firings until retransmit */
-#define RETRANSMIT_TIMEOUT      4
+#define RETRANSMIT_TIMEOUT      TCP_TIMER_PER_SEC
+
+/* Number of syn-ack retransmissions we will attempt */
+#define SYNACK_ATTEMPTS_MAX     5
+
+/* Use the Linux default, TODO: make configurable */
+#define TIMEWAIT_SECONDS        60
+#define TIMEWAIT_TIMEOUT        TCP_TIMER_PER_SEC * TIMEWAIT_SECONDS
 
 /* Number of timer firings until window update monitoring expires */
-#define WIN_WORK_TIMEOUT        2
+#define WIN_WORK_TIMEOUT        (TCP_TIMER_PER_SEC / 2)
 
 /* Number of jiffies until an incomplete TCP request expires */
 #define TCP_REQUEST_JIFFIES     HZ
+
+/* Number of jiffies before we retransmit syn-ack */
+#define TCP_SYNACK_JIFFIES      (HZ / 2)
 
 #define SEQNUM_ROLLOVER(start, last, now)   ((now) - (last) > (now) - (start))
 #define SEQNUM_TO_BYTES(start, now, rounds) \
@@ -219,12 +318,157 @@ static struct delayed_work      tcp_req_work;
 #define TCP_STATE_CMPXCHG(ts, old, new) \
                                        (cmpxchg(&(ts)->state, old, new) == old)
 
+/* on closing an ATE connection, both hardware and software injected
+ * TCP payload are disabled. exasock_ate_wait_echo then waits
+ * for the hardware sequence number to stabilise.
+ *
+ * if the send sequence number register stays the same for 5ms,
+ * it is assumed that the hardware TCP engine has become idle. */
+#define ATE_HWSEQ_INTERVAL_MS   5
+
+/* after the HW sequence number stabilises, we wait for
+ * all mirrored TCP segments to come back. in the
+ * unfortunate case that the last SW injected
+ * payload is lost, wait at most 5 seconds
+ * before treating the packet as lost */
+#define ATE_MIRROR_SEGS_TIMEOUT (5 * HZ)
+
+static uint32_t exasock_ate_read_seq(struct exasock_tcp *tcp);
+static void exasock_tcp_send_segment(struct exasock_tcp *tcp, uint32_t seq,
+                                     uint32_t len, bool dup);
 static void exasock_tcp_conn_worker(struct work_struct *work);
 static void exasock_tcp_conn_win_worker(struct work_struct *work);
+static void exasock_tcp_close_worker(struct work_struct *work);
+
 static void exasock_tcp_retransmit(struct exasock_tcp *tcp, bool fast_retrans);
 static void exasock_tcp_send_ack(struct exasock_tcp *tcp, bool dup);
 static void exasock_tcp_send_reset(struct exasock_tcp *tcp);
+uint32_t exasock_tcp_req_get_isn(struct exasock_tcp_req *req);
 static void exasock_tcp_send_syn_ack(struct exasock_tcp_req *req);
+static uint16_t exasock_tcp_calc_window(struct exasock_tcp *tcp,
+                                        uint32_t recv_seq);
+static struct exasock_tcp *exasock_tcp_lookup(uint32_t local_addr,
+                                              uint32_t peer_addr,
+                                              uint16_t local_port,
+                                              uint16_t peer_port);
+static void exasock_tcp_dead(struct kref *ref);
+static void exasock_tcp_send_probe(struct exasock_tcp *tcp);
+static struct exasock_tcp *exasock_tcp_lookup(uint32_t local_addr,
+                                              uint32_t peer_addr,
+                                              uint16_t local_port,
+                                              uint16_t peer_port);
+
+/* this work reclaims all resources allocated for a
+ * tcp connection. this function may sleep.
+ * note: do not call it directly, only run on
+ *       tcp_gc_workqueue */
+static void exasock_tcp_gc_worker(struct work_struct *work);
+static void exasock_tcp_dead(struct kref *ref);
+/* this function performs some clean-up before
+ * deferring exasock_tcp_gc_worker to the cleanup workqueue */
+static void exasock_tcp_free(struct exasock_tcp *tcp);
+
+const char *tcp_state_text[EXA_TCP_TIME_WAIT + 1] =
+{
+    "EXA_TCP_CLOSED",
+    "EXA_TCP_LISTEN",
+    "EXA_TCP_SYN_SENT",
+    "EXA_TCP_SYN_RCVD",
+    "EXA_TCP_ESTABLISHED",
+    "EXA_TCP_CLOSE_WAIT",
+    "EXA_TCP_FIN_WAIT_1",
+    "EXA_TCP_FIN_WAIT_2",
+    "EXA_TCP_CLOSING",
+    "EXA_TCP_LAST_ACK",
+    "EXA_TCP_TIME_WAIT",
+};
+
+#ifdef EXASOCK_SESSION_DEBUG
+#define exasock_tcp_debug_log(tcp, fmt, ...) \
+    pr_info("[%hu, %hu] [%s] :" fmt, ntohs(tcp->local_port),\
+                                ntohs(tcp->peer_port),\
+                                tcp_state_text[tcp->user_page->p.tcp.state],\
+                                ##__VA_ARGS__)
+#else
+#define exasock_tcp_debug_log(x, y, ...)
+#endif
+
+/*
+ * free all "stray" sessions, i.e.
+ * those connections that the user has closed
+ * but not yet cleaned up, e.g. in TIME_WAIT
+ */
+static inline void exasock_tcp_kill_stray(void)
+{
+    /* by this point everything on the death row should
+     * be dormant and safe to kill. */
+    struct exasock_tcp *tcp;
+    rcu_read_lock();
+    list_for_each_entry_rcu(tcp, &tcp_wait_death_list, death_link)
+    {
+        tcp->reset_on_free =
+            tcp->user_page->p.tcp.state != EXA_TCP_TIME_WAIT;
+        exasock_tcp_free(tcp);
+    }
+    rcu_read_unlock();
+    flush_workqueue(tcp_gc_workqueue);
+    destroy_workqueue(tcp_gc_workqueue);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 13, 0)
+static inline void exasock_tcp_secret_init(void)
+{
+    net_get_random_once(&tcp_secret, sizeof(tcp_secret));
+}
+#else
+static DEFINE_SPINLOCK(isn_lock);
+static inline void exasock_tcp_secret_init(void)
+{
+    static bool done = false;
+    if (likely(done))
+        return;
+
+    spin_lock(&isn_lock);
+    if (!done)
+    {
+        get_random_bytes(&tcp_secret, sizeof(tcp_secret));
+        done = true;
+    }
+    spin_unlock(&isn_lock);
+}
+#endif
+
+static inline uint32_t exasock_tcp_isn_hash(uint32_t local_addr,
+                                            uint32_t peer_addr,
+                                            uint16_t local_port,
+                                            uint16_t peer_port)
+{
+    uint32_t hash;
+    exasock_tcp_secret_init();
+    hash = siphash_3u32(local_addr, peer_addr,
+                       ((uint32_t)local_port) << 16 | (uint32_t)peer_port,
+                       &tcp_secret);
+    return hash;
+}
+
+/* the Linux function for secure, monotonically increasing isn
+ * is not available for use here unless the newest kernel is installed
+ *
+ * however the algorithm is simple so just lifted it all here instead */
+uint32_t exasock_tcp_get_isn(struct exasock_tcp *tcp)
+{
+    return (ktime_to_ns(ktime_get_real()) >> 6) +
+            exasock_tcp_isn_hash(tcp->local_addr, tcp->peer_addr,
+                                 tcp->local_port, tcp->peer_port);
+}
+
+/* for syn-ack segments */
+uint32_t exasock_tcp_req_get_isn(struct exasock_tcp_req *req)
+{
+    return (ktime_to_ns(ktime_get_real()) >> 6) +
+            exasock_tcp_isn_hash(req->local_addr, req->peer_addr,
+                                 req->local_port, req->peer_port);
+}
 
 static inline void exasock_tcp_counters_update_locked(
                                           struct exasock_tcp_conn_counters *cnt,
@@ -358,7 +602,11 @@ static void exasock_tcp_stats_get_snapshot_conn(struct exasock_tcp *tcp,
     state = tcp_st->state;
 
     ssbrf->recv_q = recv_seq - read_seq;
-    ssbrf->send_q = send_seq - send_ack;
+
+    if (unlikely(after(send_ack, send_seq)))
+        ssbrf->send_q = 0;
+    else
+        ssbrf->send_q = send_seq - send_ack;
 
     if (ssconn != NULL)
     {
@@ -487,6 +735,380 @@ static void exasock_tcp_stats_update(struct exasock_tcp *tcp)
                                 EXASOCK_SOCKTYPE_TCP, &addr);
 }
 
+static void exasock_ate_put_skb_on_tx(struct sk_buff *skb)
+{
+    struct exasock_tcp *tcp;
+    struct exa_socket_state *state;
+    char *data = skb->data;
+    struct iphdr *iph = (struct iphdr *)data;
+    struct tcphdr *th = (struct tcphdr *)(data + iph->ihl * 4);
+    size_t len, buf_offs, l;
+    uint32_t seq;
+
+    /* Look up socket */
+    rcu_read_lock();
+    tcp = exasock_tcp_lookup(iph->saddr, iph->daddr, th->source, th->dest);
+    if (tcp == NULL)
+    {
+        rcu_read_unlock();
+        return;
+    }
+    kref_get(&tcp->refcount);
+    rcu_read_unlock();
+
+    state = tcp->user_page;
+    data += (iph->ihl * 4) + (th->doff * 4);
+    len = ntohs(iph->tot_len) - (iph->ihl * 4) - (th->doff * 4);
+    seq = ntohl(th->seq);
+
+    /* ATE-enabled connection check */
+    if (unlikely(!tcp->ate.active))
+    {
+        goto release_tcp;
+    }
+
+    /* ATE packet reordered! */
+    if (unlikely(before(seq, tcp->ate.last_mirror_seq) &&
+                 tcp->ate.echo_rcvd))
+    {
+        goto release_tcp;
+    }
+
+    tcp->ate.echo_rcvd = true;
+    tcp->ate.last_mirror_seq = seq;
+    tcp->ate.last_mirror_len = len;
+    wake_up(&tcp->ate.mirror_wtq);
+
+    /* gap in segments from ATE.
+     * previous segments might have been dropped.*/
+    if (unlikely(after(seq, state->p.tcp.send_seq)))
+    {
+        goto release_tcp;
+    }
+
+    /* If only this is a new data, store it in the retransmit buffer */
+    if (after(seq + len, state->p.tcp.send_seq))
+    {
+        buf_offs = seq & (state->tx_buffer_size - 1);
+
+        if (buf_offs + len < state->tx_buffer_size)
+        {
+            memcpy(tcp->tx_buffer + buf_offs, data, len);
+        }
+        else
+        {
+            l = state->tx_buffer_size - buf_offs;
+            memcpy(tcp->tx_buffer + buf_offs, data, l);
+            memcpy(tcp->tx_buffer, data + l, len - l);
+        }
+
+        wmb();
+        state->p.tcp.send_seq = seq + len;
+    }
+
+release_tcp:
+    kref_put(&tcp->refcount, exasock_tcp_dead);
+    return;
+}
+
+static void exasock_ate_skb_proc_worker(struct work_struct *work)
+{
+    struct sk_buff *skb;
+
+    while ((skb = skb_dequeue_tail(&ate_packets)) != NULL)
+    {
+        exasock_ate_put_skb_on_tx(skb);
+        dev_kfree_skb_any(skb);
+    }
+}
+
+static void exasock_ate_process_skb(struct sk_buff *skb)
+{
+    struct exasock_tcp *tcp;
+    char *data = skb->data;
+    struct iphdr *iph = (struct iphdr *)data;
+    struct tcphdr *th;
+
+    /* Length sanity checks */
+    if (unlikely(skb->len < sizeof(struct iphdr) ||
+                 skb->len < (iph->ihl * 4 + sizeof(struct tcphdr)) ||
+                 skb->len < ntohs(iph->tot_len)))
+        goto error;
+
+    /* Protocol checks */
+    if (unlikely(skb->protocol != htons(ETH_P_IP) ||
+                 iph->protocol != IPPROTO_TCP))
+        goto error;
+
+    /* Look up socket */
+    th = (struct tcphdr *)(data + iph->ihl * 4);
+    rcu_read_lock();
+    tcp = exasock_tcp_lookup(iph->saddr, iph->daddr, th->source, th->dest);
+    rcu_read_unlock();
+    if (tcp == NULL)
+        goto error;
+
+    /* Queue the packet to be processed after a short delay */
+    skb_queue_head(&ate_packets, skb);
+    queue_work(tcp_workqueue, &ate_skb_proc_work);
+
+    return;
+
+error:
+    dev_kfree_skb_any(skb);
+    return;
+}
+
+static void exasock_ate_update(struct exasock_tcp *tcp)
+{
+    struct exanic_ate_update cfg;
+    struct exa_tcp_state *tcp_st = &tcp->user_page->p.tcp;
+    uint32_t recv_seq = tcp_st->recv_seq;
+    uint32_t rwnd_end = tcp_st->rwnd_end;
+    uint32_t cwnd_end = tcp_st->send_ack + tcp_st->cwnd;
+
+    uint32_t cfg_ack = recv_seq;
+
+    if (tcp_st->state == EXA_TCP_CLOSE_WAIT ||
+        tcp_st->state == EXA_TCP_CLOSING    ||
+        tcp_st->state == EXA_TCP_LAST_ACK   ||
+        tcp_st->state == EXA_TCP_TIME_WAIT)
+    {
+        cfg_ack += 1;
+    }
+
+    cfg.ack_num = htonl(cfg_ack);
+    cfg.window = htons(exasock_tcp_calc_window(tcp, recv_seq));
+    cfg.max_seq_num = after(rwnd_end, cwnd_end) ? htonl(cwnd_end) :
+                      htonl(rwnd_end);
+
+    exanic_netdev_ate_update(exasock_get_realdev(tcp->ate.ndev),
+                             tcp->ate.id, &cfg);
+
+    tcp_st->ate_wnd_end = cfg.max_seq_num;
+}
+
+static uint32_t exasock_ate_read_seq(struct exasock_tcp *tcp)
+{
+    uint32_t seq;
+    seq = exanic_netdev_ate_read_seq(exasock_get_realdev(tcp->ate.ndev),
+                                     tcp->ate.id);
+    return ntohl(seq);
+}
+
+static void exasock_ate_send_ack(struct exasock_tcp *tcp, bool dup)
+{
+    /* if ATE is not yet configured, we need to drop this ACK */
+    if (!tcp->ate.active)
+        return;
+
+    /* Clear ack_pending flag because an ACK is about to be sent */
+    tcp->user_page->p.tcp.ack_pending = false;
+
+    /* update ATE state */
+    if (!dup)
+        exasock_ate_update(tcp);
+
+    /* send ACK through ATE */
+    exanic_netdev_ate_send_ctrl(exasock_get_realdev(tcp->ate.ndev),
+                                tcp->ate.id);
+}
+
+int exasock_ate_enable(struct exasock_tcp *tcp, int ate_id)
+{
+    struct net_device *ndev, *realdev;
+    int err;
+
+    BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
+    BUG_ON(tcp->hdr.socket.domain != AF_INET);
+    BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
+
+    if (tcp->ate.id != -1)
+        return -EBUSY;
+
+    ndev = exasock_dst_get_netdev(tcp->peer_addr, tcp->local_addr);
+    if (ndev == NULL)
+        return -ENETUNREACH;
+
+    realdev = exasock_get_realdev(ndev);
+
+    /* Verify that output interface is an ExaNIC */
+    if (!exasock_is_exanic_dev(realdev))
+    {
+        err = -ENETUNREACH;
+        goto error;
+    }
+    /*
+     * the ATE session is released in the close_worker function,
+     * which runs on tcp_workqueue
+     * before that happens, the next process that wants the
+     * old ATE ID must wait
+     */
+    err = exanic_netdev_ate_acquire(realdev, ate_id);
+    if (err)
+        goto error;
+
+    tcp->ate.ndev = ndev;
+    tcp->ate.id = ate_id;
+
+    return 0;
+
+error:
+    if (ndev)
+        dev_put(ndev);
+    return err;
+}
+
+int exasock_ate_init(struct exasock_tcp *tcp)
+{
+    struct exanic_ate_cfg cfg;
+    struct exa_tcp_state *tcp_st;
+    uint8_t *eth_dst;
+    uint32_t recv_seq;
+    uint32_t rwnd_end;
+    uint32_t cwnd_end;
+    int err;
+
+    BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
+    BUG_ON(tcp->hdr.socket.domain != AF_INET);
+    BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
+
+    if(tcp->ate.id == -1)
+        return -EPERM;
+
+    /* TODO: Add ATE updating during connection's lifetime whenever destination
+     *       entry gets modified. This includes also keeping the destination
+     *       entry marked as used for the whole lifetime of the connection. */
+    eth_dst = exasock_dst_get_dmac(tcp->peer_addr, tcp->local_addr);
+    if (eth_dst == NULL)
+    {
+        /* TODO: create / update destination entry */
+        return -ENETUNREACH;
+    }
+
+    tcp_st = &tcp->user_page->p.tcp;
+    recv_seq = tcp_st->recv_seq;
+    rwnd_end = tcp_st->rwnd_end;
+    cwnd_end = tcp_st->send_ack + tcp_st->cwnd;
+
+    memcpy(cfg.eth_dst, eth_dst, ETH_ALEN);
+    memcpy(cfg.eth_src, tcp->ate.ndev->dev_addr, ETH_ALEN);
+    cfg.ip_dst = tcp->peer_addr;
+    cfg.ip_src = tcp->local_addr;
+    cfg.port_dst = tcp->peer_port;
+    cfg.port_src = tcp->local_port;
+    cfg.init_seq_num = htonl(tcp_st->send_seq);
+    cfg.ack_num = htonl(recv_seq);
+
+    cfg.window = htons(exasock_tcp_calc_window(tcp, recv_seq));
+    cfg.max_seq_num = after(rwnd_end, cwnd_end) ? htonl(cwnd_end) :
+                      htonl(rwnd_end);
+    cfg.rmss = htons(tcp_st->rmss);
+
+    cfg.win_limit_disabled = ate_win_limit_off;
+
+    err = exanic_netdev_ate_init(exasock_get_realdev(tcp->ate.ndev),
+                                          tcp->ate.id, &cfg);
+    if (err)
+        return err;
+
+    init_waitqueue_head(&tcp->ate.mirror_wtq);
+    tcp->ate.last_mirror_seq = 0;
+    tcp->ate.last_mirror_len = 0;
+    tcp->ate.echo_rcvd = false;
+    tcp->ate.tx_disabled = false;
+
+    tcp_st->ate_wnd_end = cfg.max_seq_num;
+
+    tcp->ate.active = true;
+    return 0;
+}
+
+static void exasock_ate_disable(struct exasock_tcp *tcp)
+{
+    BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
+    BUG_ON(tcp->hdr.socket.domain != AF_INET);
+    BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
+    BUG_ON(tcp->ate.id == -1);
+
+    tcp->ate.tx_disabled = true;
+    /* flush all payload sent before this point to HW */
+    wmb();
+    exanic_netdev_ate_disable(exasock_get_realdev(tcp->ate.ndev), tcp->ate.id);
+}
+
+static void exasock_ate_release(struct exasock_tcp *tcp)
+{
+    int ate_id = tcp->ate.id;
+
+    BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
+    BUG_ON(tcp->hdr.socket.domain != AF_INET);
+    BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
+    BUG_ON(tcp->ate.id == -1);
+
+    tcp->ate.active = false;
+    tcp->ate.id = -1;
+
+    exanic_netdev_ate_release(exasock_get_realdev(tcp->ate.ndev), ate_id);
+
+    dev_put(tcp->ate.ndev);
+    tcp->ate.ndev = NULL;
+}
+
+/* use this function to decide when to stop waiting
+ * on the wait queue. returns true if the echoed
+ * segments have caught up with the send sequence
+ * number.
+ *
+ * hwseq: sequence number read from bar0 indicating
+ *        that last sequence number assigned by ATE
+ */
+static inline bool
+exasock_ate_mirror_caught_up(struct exasock_tcp *tcp,
+                             uint32_t hwseq)
+{
+    /* no packet ever came back to SW,
+     * don't check seq numbers */
+    if (unlikely(!tcp->ate.echo_rcvd))
+        return false;
+
+    return after_eq(tcp->ate.last_mirror_seq +
+                    tcp->ate.last_mirror_len, hwseq);
+}
+
+/* wait for mirrored packets to come from the HW.
+ * returns -1 on timeout */
+static int exasock_ate_wait_echo(struct exasock_tcp *tcp)
+{
+    uint32_t hwseq, hwseq_new;
+    bool timeout;
+
+    /* wait for hwseq to stabilise, indicating
+     * that SW segments have been seen by ATE */
+    do
+    {
+        hwseq = exasock_ate_read_seq(tcp);
+        msleep(ATE_HWSEQ_INTERVAL_MS);
+        hwseq_new = exasock_ate_read_seq(tcp);
+    }
+    while (hwseq != hwseq_new);
+
+    timeout = !wait_event_timeout(tcp->ate.mirror_wtq,
+                  exasock_ate_mirror_caught_up(tcp, hwseq),
+                  ATE_MIRROR_SEGS_TIMEOUT);
+    /* mirrored segments didn't catch up even
+     * after 5 seconds, give up */
+    if (timeout)
+        return -1;
+
+    /* there were gaps in mirrored segments,
+     * don't enter fin handshake */
+    if (before(tcp->user_page->p.tcp.send_seq, hwseq))
+        return -1;
+
+    return 0;
+}
+
 static unsigned exasock_tcp_hash(uint32_t local_addr, uint32_t peer_addr,
                                  uint16_t local_port, uint16_t peer_port)
 {
@@ -520,8 +1142,12 @@ struct exasock_tcp *exasock_tcp_alloc(struct socket *sock, int fd)
     /* Get local address from native socket */
     slen = sizeof(local);
     memset(&local, 0, sizeof(local));
+#ifdef __GETNAME_NO_SOCKLEN_PARAM
+    err = slen = sock->ops->getname(sock, (struct sockaddr *)&local, 0);
+#else
     err = sock->ops->getname(sock, (struct sockaddr *)&local, &slen, 0);
-    if (err)
+#endif
+    if (err < 0)
         goto err_sock_getname;
 
     /* TODO: Check that socket is not connected */
@@ -549,7 +1175,10 @@ struct exasock_tcp *exasock_tcp_alloc(struct socket *sock, int fd)
     tcp->user_page = user_page;
     tcp->sock = sock;
     tcp->retransmit_countdown = -1;
+    tcp->timewait_countdown = -1;
     tcp->dead_node = false;
+    tcp->ate.id = -1;
+    tcp->reset_on_free = false;
 
     for (i = 0; i < EXA_TCP_MAX_RX_SEGMENTS; i++)
         INIT_LIST_HEAD(&tcp->rx_seg[i].seg_list);
@@ -558,12 +1187,15 @@ struct exasock_tcp *exasock_tcp_alloc(struct socket *sock, int fd)
 
     kref_init(&tcp->refcount);
     sema_init(&tcp->dead_sema, 0);
-    spin_lock_init(&tcp->notify_lock);
+    spin_lock_init(&tcp->notify.lock);
 
     INIT_DELAYED_WORK(&tcp->work, exasock_tcp_conn_worker);
     queue_delayed_work(tcp_workqueue, &tcp->work, TCP_TIMER_JIFFIES);
 
     INIT_DELAYED_WORK(&tcp->win_work, exasock_tcp_conn_win_worker);
+    INIT_DELAYED_WORK(&tcp->fin_work, exasock_tcp_close_worker);
+    INIT_DELAYED_WORK(&tcp->gc_work,  exasock_tcp_gc_worker);
+    INIT_LIST_HEAD(&tcp->death_link);
 
     hash = exasock_tcp_hash(tcp->local_addr, tcp->peer_addr,
                             tcp->local_port, tcp->peer_port);
@@ -588,6 +1220,9 @@ struct exasock_tcp *exasock_tcp_alloc(struct socket *sock, int fd)
 
     /* Invalidate duplicate ACKs trigger */
     user_page->p.tcp.dup_acks_seq = user_page->p.tcp.recv_seq - 1;
+
+    /* Set tx consistency flag */
+    user_page->p.tcp.tx_consistent = 1;
 
     return tcp;
 
@@ -622,8 +1257,12 @@ int exasock_tcp_bind(struct exasock_tcp *tcp, uint32_t local_addr,
     /* Get assigned port from native socket */
     slen = sizeof(sa);
     memset(&sa, 0, sizeof(sa));
+#ifdef __GETNAME_NO_SOCKLEN_PARAM
+    err = slen = tcp->sock->ops->getname(tcp->sock, (struct sockaddr *)&sa, 0);
+#else
     err = tcp->sock->ops->getname(tcp->sock, (struct sockaddr *)&sa, &slen, 0);
-    if (err)
+#endif
+    if (err < 0)
         return err;
 
     tcp->local_addr = sa.sin_addr.s_addr;
@@ -641,22 +1280,62 @@ int exasock_tcp_bind(struct exasock_tcp *tcp, uint32_t local_addr,
     return 0;
 }
 
-void exasock_tcp_update(struct exasock_tcp *tcp,
-                        uint32_t local_addr, uint16_t local_port,
-                        uint32_t peer_addr, uint16_t peer_port)
+static void exasock_tcp_dead(struct kref *ref)
 {
+    struct exasock_tcp *tcp = container_of(ref, struct exasock_tcp, refcount);
+    up(&tcp->dead_sema);
+}
+
+/* need biglock for this one function to avoid race condition */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 36)
+static DECLARE_MUTEX(update_biglock);
+#else
+static DEFINE_SEMAPHORE(update_biglock);
+#endif
+int exasock_tcp_update(struct exasock_tcp *tcp,
+                       uint32_t local_addr, uint16_t local_port,
+                       uint32_t peer_addr, uint16_t peer_port)
+{
+    struct exasock_tcp *old;
+    int err;
     BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
     BUG_ON(tcp->hdr.socket.domain != AF_INET);
     BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
 
+    err = down_interruptible(&update_biglock);
+    if (err)
+        return err;
     /* Update kernel struct with provided addresses and ports */
     tcp->local_addr = local_addr;
     tcp->local_port = local_port;
     tcp->peer_addr = peer_addr;
     tcp->peer_port = peer_port;
 
+    /*
+     * Make sure that the (saddr, daddr, sport, dport) tuple
+     * is not in use, either as an active connection or is
+     * in TIME_WAIT
+     *
+     */
+    rcu_read_lock();
+    old = exasock_tcp_lookup(local_addr, peer_addr,
+                             local_port, peer_port);
+    if (old && old != tcp)
+    {
+        if (old->local_addr == tcp->local_addr &&
+            old->peer_addr  == tcp->peer_addr  &&
+            old->local_port == tcp->local_port &&
+            old->peer_port  == tcp->peer_port)
+        {
+            rcu_read_unlock();
+            up(&update_biglock);
+            return -EADDRNOTAVAIL;
+        }
+    }
+    rcu_read_unlock();
     /* Update hash table */
     exasock_tcp_update_hashtbl(tcp);
+    up(&update_biglock);
 
     /* Update user page */
     tcp->user_page->e.ip.local_addr = tcp->local_addr;
@@ -669,27 +1348,113 @@ void exasock_tcp_update(struct exasock_tcp *tcp,
     tcp->dup_acks.win_end = tcp->user_page->p.tcp.rwnd_end;
 
     exasock_tcp_stats_update(tcp);
+    return 0;
 }
 
-void exasock_tcp_dead(struct kref *ref)
+static void exasock_tcp_close_worker(struct work_struct *work)
 {
-    struct exasock_tcp *tcp = container_of(ref, struct exasock_tcp, refcount);
-    up(&tcp->dead_sema);
+    struct delayed_work *dwork = container_of(work, struct delayed_work, work);
+    struct exasock_tcp *tcp = container_of(dwork, struct exasock_tcp, fin_work);
+
+    struct exa_socket_state *sock_state = tcp->user_page;
+    struct exa_tcp_state *tcp_st;
+    bool   send_fin = false;
+
+    tcp_st = &sock_state->p.tcp;
+    tcp->user_closed = true;
+
+    if (tcp->ate.id != -1)
+    {
+        exasock_ate_release(tcp);
+    }
+
+    spin_lock(&tcp_wait_death_lock);
+    list_add_rcu(&tcp->death_link, &tcp_wait_death_list);
+    spin_unlock(&tcp_wait_death_lock);
+
+    if (tcp->reset_on_free ||
+        tcp->peer_addr == htonl(INADDR_ANY) ||
+        tcp->user_page->p.tcp.state == EXA_TCP_CLOSED ||
+        tcp->user_page->p.tcp.state == EXA_TCP_SYN_SENT ||
+        tcp->user_page->p.tcp.state == EXA_TCP_SYN_RCVD)
+    {
+        exasock_tcp_free(tcp);
+        return;
+    }
+
+    /*
+     * if we are in close_wait, i.e. peer has closed the connection, or
+     * we are in established, then send a fin packet over.
+     *
+     * in the case that the connection is in established state, we make
+     * no distinction whether a fin is already received and queued. we
+     * treat it as simultaneous close instead for simplicity.
+     *
+     * since all userspace processes have called close() on the socket,
+     * the driver now has the only handle to the tcp connection, hence
+     * the lack of compare-and-swap below
+     *
+     */
+    if (tcp_st->state == EXA_TCP_ESTABLISHED)
+    {
+        tcp_st->state = EXA_TCP_FIN_WAIT_1;
+        send_fin = true;
+    }
+    else if (tcp_st->state == EXA_TCP_CLOSE_WAIT)
+    {
+        tcp_st->state = EXA_TCP_LAST_ACK;
+        send_fin = true;
+    }
+
+    if (send_fin)
+        exasock_tcp_send_segment(tcp, tcp_st->send_seq, 0, false);
 }
 
-void exasock_tcp_free(struct exasock_tcp *tcp)
+void exasock_tcp_close(struct exasock_tcp *tcp)
 {
-    int i;
+    /* don't enter fin handshake if the user app's
+     * tx state is inconsistent, e.g. killed in the
+     * middle of send(), or the echoed segments
+     * are lost*/
 
+    if (tcp->ate.active)
+    {
+        /* turn HW injection off */
+        exasock_ate_disable(tcp);
+        tcp->reset_on_free = (exasock_ate_wait_echo(tcp) != 0);
+    }
+    else if (unlikely(!tcp->user_page->p.tcp.tx_consistent))
+        tcp->reset_on_free = true;
+
+    queue_delayed_work(tcp_workqueue, &tcp->fin_work, 0);
+}
+
+/* note: this function can be run either on the main tcp_workqueue
+ *       or from a user app's context */
+static void exasock_tcp_free(struct exasock_tcp *tcp)
+{
     BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
     BUG_ON(tcp->hdr.socket.domain != AF_INET);
     BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
+
+    /* prevent double-free from tcp_workqueue
+     * e.g. time-wait timeout immediately following recycle
+     * no race condition in the check because the workqueue
+     * is single threaded.
+     *
+     * if this function is called from user's context,
+     * it will not have entered FIN handshake, therefore
+     * no double free issue */
+
+    if (tcp->dead_node)
+        return;
 
     /* Close stats */
     exasock_stats_socket_del(&tcp->stats, EXASOCK_SOCKTYPE_TCP);
 
     /* Send reset packet */
-    exasock_tcp_send_reset(tcp);
+    if (tcp->reset_on_free)
+        exasock_tcp_send_reset(tcp);
 
     /* If there are still any packets pending in destination table queue,
      * it means the socket does not have a valid neighbour. These packets
@@ -697,11 +1462,28 @@ void exasock_tcp_free(struct exasock_tcp *tcp)
     exasock_dst_remove_socket(tcp->local_addr, tcp->peer_addr,
                               tcp->local_port, tcp->peer_port);
 
-    /* Remove from hash table */
+    /* Remove from epoll notify */
+    exasock_epoll_notify_del(&tcp->notify);
+
+    /* Remove from hash table. */
     spin_lock(&tcp_bucket_lock);
     hlist_del_rcu(&tcp->hash_node);
     spin_unlock(&tcp_bucket_lock);
+
     tcp->dead_node = true;
+    /* defer blocking operations to the GC workqueue */
+    queue_delayed_work(tcp_gc_workqueue, &tcp->gc_work, 0);
+}
+
+static void exasock_tcp_gc_worker(struct work_struct *work)
+{
+    struct delayed_work *dwork = container_of(work, struct delayed_work, work);
+    struct exasock_tcp *tcp = container_of(dwork, struct exasock_tcp, gc_work);
+    int i;
+
+    spin_lock(&tcp_wait_death_lock);
+    list_del_rcu(&tcp->death_link);
+    spin_unlock(&tcp_wait_death_lock);
 
     synchronize_rcu();
 
@@ -715,6 +1497,7 @@ void exasock_tcp_free(struct exasock_tcp *tcp)
     /* No readers left, it is now safe to free everything */
     for (i = 0; i < EXA_TCP_MAX_RX_SEGMENTS; i++)
         exasock_tcp_seg_list_cleanup(&tcp->rx_seg[i].seg_list);
+
     sockfd_put(tcp->sock);
     vfree(tcp->user_page);
     vfree(tcp->rx_buffer);
@@ -738,55 +1521,6 @@ int exasock_tcp_state_mmap(struct exasock_tcp *tcp, struct vm_area_struct *vma)
 {
     return remap_vmalloc_range(vma, tcp->user_page,
             vma->vm_pgoff - (EXASOCK_OFFSET_SOCKET_STATE / PAGE_SIZE));
-}
-
-/* Looks up exasock_tcp struct for a listening socket in hashtable.
- * RCU read lock must be held. */
-static struct exasock_tcp *exasock_tcp_listen_lookup(uint32_t local_addr,
-                                              uint16_t local_port)
-{
-    struct exasock_tcp *tcp;
-#ifdef __HAS_OLD_HLIST_ITERATOR
-    struct hlist_node *n;
-#endif
-    unsigned hash;
-
-    /* Try to match (local_addr, local_port) */
-    hash = exasock_tcp_hash(local_addr, htonl(INADDR_ANY), local_port, 0);
-    hlist_for_each_entry_rcu(tcp,
-#ifdef __HAS_OLD_HLIST_ITERATOR
-                             n,
-#endif
-                             &tcp_buckets[hash], hash_node)
-    {
-        if (tcp->local_addr == local_addr &&
-            tcp->peer_addr == htonl(INADDR_ANY) &&
-            tcp->local_port == local_port &&
-            tcp->peer_port == 0)
-        {
-            return tcp;
-        }
-    }
-
-    /* Try to match local_port only */
-    hash = exasock_tcp_hash(htonl(INADDR_ANY), htonl(INADDR_ANY), local_port,
-                            0);
-    hlist_for_each_entry_rcu(tcp,
-#ifdef __HAS_OLD_HLIST_ITERATOR
-                             n,
-#endif
-                             &tcp_buckets[hash], hash_node)
-    {
-        if (tcp->local_addr == htonl(INADDR_ANY) &&
-            tcp->peer_addr == htonl(INADDR_ANY) &&
-            tcp->local_port == local_port &&
-            tcp->peer_port == 0)
-        {
-            return tcp;
-        }
-    }
-
-    return NULL;
 }
 
 /* Looks up exasock_tcp struct in hashtable.
@@ -915,12 +1649,15 @@ static bool exasock_tcp_intercept(struct sk_buff *skb)
 }
 
 static void exasock_tcp_update_state(volatile struct exa_tcp_state *tcp_st,
-                                     uint32_t seq, unsigned len, bool th_ack,
-                                     bool th_fin)
+                                     struct exasock_tcp *tcp, uint32_t seq,
+                                     unsigned len, bool th_ack, bool th_fin)
 {
-    if (before(seq, tcp_st->recv_seq))
-        tcp_st->ack_pending = true;
+    bool fw1_fin = false, fw1_ack = false;
 
+    if (before(seq, tcp_st->recv_seq))
+    {
+        tcp_st->ack_pending = true;
+    }
 update_state:
     switch (tcp_st->state)
     {
@@ -935,14 +1672,28 @@ update_state:
         break;
 
     case EXA_TCP_FIN_WAIT_1:
-        if (th_fin && before_eq(seq + len, tcp_st->recv_seq))
+        /*
+         * if the passive closer is ready to close,
+         * it will set both flags high
+         */
+        fw1_fin = (th_fin && before_eq(seq + len, tcp_st->recv_seq));
+        fw1_ack = (th_ack && before(tcp_st->send_seq, tcp_st->send_ack));
+
+        if (fw1_fin && fw1_ack)
+        {
+            /* Received ACK for our FIN, remote peer is also closed */
+            if (!TCP_STATE_CMPXCHG(tcp_st, EXA_TCP_FIN_WAIT_1, EXA_TCP_TIME_WAIT))
+                goto update_state;
+            tcp_st->ack_pending = true;
+        }
+        else if (fw1_fin)
         {
             /* Simultaneous close */
             if (!TCP_STATE_CMPXCHG(tcp_st, EXA_TCP_FIN_WAIT_1, EXA_TCP_CLOSING))
                 goto update_state;
             tcp_st->ack_pending = true;
         }
-        else if (th_ack && before(tcp_st->send_seq, tcp_st->send_ack))
+        else if (fw1_ack)
         {
             /* Received ACK for our FIN, but remote peer is not closed */
             if (!TCP_STATE_CMPXCHG(tcp_st, EXA_TCP_FIN_WAIT_1, EXA_TCP_FIN_WAIT_2))
@@ -962,14 +1713,33 @@ update_state:
 
     case EXA_TCP_CLOSING:
         if (th_ack && before(tcp_st->send_seq, tcp_st->send_ack))
+        {
             if (!TCP_STATE_CMPXCHG(tcp_st, EXA_TCP_CLOSING, EXA_TCP_TIME_WAIT))
                 goto update_state;
+        }
+        break;
+
+    case EXA_TCP_CLOSE_WAIT:
+        if (th_fin && before_eq(seq + len, tcp_st->recv_seq))
+        {
+            tcp_st->ack_pending = true;
+        }
         break;
 
     case EXA_TCP_LAST_ACK:
         if (th_ack && before(tcp_st->send_seq, tcp_st->send_ack))
+        {
             if (!TCP_STATE_CMPXCHG(tcp_st, EXA_TCP_LAST_ACK, EXA_TCP_CLOSED))
                 goto update_state;
+        }
+        break;
+
+    case EXA_TCP_TIME_WAIT:
+        if (th_fin && before_eq(seq + len, tcp_st->recv_seq))
+        {
+            tcp->timewait_dupfin = true;
+            tcp_st->ack_pending = true;
+        }
         break;
     }
 }
@@ -1331,10 +2101,11 @@ static void exasock_tcp_process_out_of_order(struct exasock_tcp *tcp,
 
 static int exasock_tcp_process_data(struct sk_buff *skb,
                                     struct exa_socket_state *state,
+                                    struct exasock_tcp *tcp,
                                     void *rx_buffer,
                                     struct exasock_tcp_rx_seg *rx_seg,
                                     char *data, unsigned seg_len, struct tcphdr *th,
-                                    bool *out_of_order)
+                                    bool *out_of_order, bool *new_data)
 {
     struct exa_tcp_state *tcp_st = &state->p.tcp;
     volatile uint32_t *tcp_st_recv_seq = &tcp_st->recv_seq;
@@ -1369,7 +2140,6 @@ static int exasock_tcp_process_data(struct sk_buff *skb,
         tcp_st->state = EXA_TCP_CLOSED;
 
         /* TODO: Flush send and receive buffers */
-
         goto skip_proc;
     }
 
@@ -1461,9 +2231,20 @@ proc_check:
     exasock_tcp_rx_seg_write(rx_seg, recv_seq, data, seg_len, seg_seq, elem);
 
     if (copy_len)
+    {
         exasock_tcp_rx_buffer_write(tcp_st, rx_seg, buf1, buf1_len, buf2, buf2_len);
+        *new_data = true;
+    }
 
-    exasock_tcp_update_state(tcp_st, seg_seq, seg_len, th_ack, th_fin);
+    exasock_tcp_update_state(tcp_st, tcp, seg_seq, seg_len, th_ack, th_fin);
+    /* make special case to get rid of spurious dup ack */
+    if (tcp_st->state == EXA_TCP_TIME_WAIT ||
+        tcp_st->state == EXA_TCP_CLOSING ||
+        tcp_st->state == EXA_TCP_LAST_ACK ||
+        tcp_st->state == EXA_TCP_CLOSE_WAIT)
+    {
+        *out_of_order = false;
+    }
 
     return 0;
 
@@ -1480,8 +2261,22 @@ static int exasock_tcp_conn_process(struct sk_buff *skb,
     uint32_t ack_seq = ntohl(th->ack_seq);
     uint8_t wscale = th->syn ? 0 : state->p.tcp.wscale;
     uint32_t win_end = ack_seq + (ntohs(th->window) << wscale);
-    bool out_of_order = false;
+    bool out_of_order = false, new_data = false;
     int err;
+
+    /* time_wait recycle
+     * accept SYN if isn > tcp->....->recv_seq
+     */
+    if (unlikely(tcp->user_closed && state->p.tcp.state == EXA_TCP_TIME_WAIT &&
+                 th->syn && after(ntohl(th->seq), state->p.tcp.recv_seq)))
+    {
+        /*
+         * put the packet back in the queue for reprocessing,
+         * schedule socket for closing
+         */
+        exasock_tcp_free(tcp);
+        return -1;
+    }
 
     if (th->ack)
     {
@@ -1492,7 +2287,7 @@ static int exasock_tcp_conn_process(struct sk_buff *skb,
             /* Duplicate ACK */
             uint32_t send_seq = state->p.tcp.send_seq;
 
-            if (ack_seq != send_seq && datalen == 0)
+            if (before(ack_seq, send_seq) && datalen == 0)
                 tcp->dup_acks.cnt++;
         }
         else
@@ -1554,7 +2349,11 @@ static int exasock_tcp_conn_process(struct sk_buff *skb,
             send_ack = state->p.tcp.send_ack;
 
             /* Adjust cwnd and ssthresh */
-            flight_size = send_seq - send_ack;
+            if (likely(before(send_ack, send_seq)))
+                flight_size = send_seq - send_ack;
+            else
+                flight_size = 0;
+
             ssthresh = flight_size / 2;
             if (ssthresh < 2 * EXA_TCP_MSS)
                 ssthresh = 2 * EXA_TCP_MSS;
@@ -1570,17 +2369,25 @@ static int exasock_tcp_conn_process(struct sk_buff *skb,
         }
     }
 
-    err = exasock_tcp_process_data(skb, state, tcp->rx_buffer, tcp->rx_seg,
-                                   data, datalen, th, &out_of_order);
-    if (err)
+    err = exasock_tcp_process_data(skb, state, tcp, tcp->rx_buffer,
+                                   tcp->rx_seg, data, datalen, th,
+                                   &out_of_order, &new_data);
+
+    if (err < 0)
         return -1; /* Segment locked, retry later */
 
-    /* Send ACK if needed */
+    /* Send ACK if needed. Update ATE state if enabled */
     if (state->p.tcp.ack_pending)
         exasock_tcp_send_ack(tcp, false);
+    else if (tcp->ate.active)
+        exasock_ate_update(tcp);
 
     /* Send duplicate ACK if out-of-order segment received */
     exasock_tcp_process_out_of_order(tcp, state, out_of_order);
+
+    /* Reset keep-alive timer */
+    tcp->keepalive.timer = state->p.tcp.keepalive.time * TCP_TIMER_PER_SEC;
+    tcp->keepalive.probe_cnt = 0;
 
     if (exasock_tcp_calc_window(tcp, state->p.tcp.recv_seq) == 0 &&
         tcp->win_work_on == 0)
@@ -1591,6 +2398,9 @@ static int exasock_tcp_conn_process(struct sk_buff *skb,
         tcp->win_work_on = WIN_WORK_TIMEOUT;
         queue_delayed_work(tcp_workqueue, &tcp->win_work, 1);
     }
+
+    if (new_data)
+        exasock_epoll_update(&tcp->notify);
 
     return 0;
 }
@@ -1603,11 +2413,26 @@ static void exasock_tcp_req_worker(struct work_struct *work)
     spin_lock(&tcp_req_lock);
     list_for_each_entry_safe(req, tmp, &tcp_req_list, list)
     {
+        if (req->state == EXA_TCP_ESTABLISHED)
+            continue;
+
         if (time_after(jiffies, req->timestamp + TCP_REQUEST_JIFFIES))
         {
             hlist_del(&req->hash_node);
             list_del(&req->list);
             kfree(req);
+            continue;
+        }
+
+        /* retransmit SYN-ACK as long as connection is incomplete
+         * and has not yet expired */
+        if (req->synack_attempts < SYNACK_ATTEMPTS_MAX &&
+            time_after(jiffies, req->timestamp +
+                    TCP_SYNACK_JIFFIES))
+        {
+            req->timestamp = jiffies;
+            ++req->synack_attempts;
+            exasock_tcp_send_syn_ack(req);
         }
     }
     spin_unlock(&tcp_req_lock);
@@ -1684,16 +2509,14 @@ static int exasock_tcp_req_process(struct sk_buff *skb, struct exasock_tcp *tcp,
             goto finish_proc;
 
         req->timestamp = jiffies;
+        req->synack_attempts = 1;
 
         req->local_addr = iph->daddr;
         req->peer_addr = iph->saddr;
         req->local_port = th->dest;
         req->peer_port = th->source;
-#ifdef __HAS_OLD_NET_RANDOM
-        req->local_seq = net_random();
-#else
-        req->local_seq = prandom_u32();
-#endif
+        req->local_seq = exasock_tcp_req_get_isn(req);
+
         req->peer_seq = ntohl(th->seq) + 1;
         req->window = ntohs(th->window);
         req->state = EXA_TCP_SYN_RCVD;
@@ -1740,7 +2563,12 @@ static int exasock_tcp_req_process(struct sk_buff *skb, struct exasock_tcp *tcp,
             goto finish_proc;
         }
 
-        if (req->state != EXA_TCP_SYN_RCVD ||
+        /* accept final ack if the sequence is correct and
+         * 1. we've just sent syn-ack
+         * 2. connection is already established - this can happen if the
+         *    accepted queue was full when the first ack was received */
+        if ((req->state != EXA_TCP_SYN_RCVD &&
+             req->state != EXA_TCP_ESTABLISHED)  ||
             req->local_seq != ntohl(th->ack_seq) ||
             req->peer_seq != ntohl(th->seq))
         {
@@ -1748,6 +2576,8 @@ static int exasock_tcp_req_process(struct sk_buff *skb, struct exasock_tcp *tcp,
             spin_unlock(&tcp_req_lock);
             goto finish_proc;
         }
+
+        req->state = EXA_TCP_ESTABLISHED;
 
         /* Insert into accepted queue */
         if (exasock_trylock(&state->rx_lock) == 0)
@@ -1786,10 +2616,7 @@ static int exasock_tcp_req_process(struct sk_buff *skb, struct exasock_tcp *tcp,
 
         exasock_unlock(&state->rx_lock);
 
-        spin_lock(&tcp->notify_lock);
-        if (tcp->notify)
-            exasock_epoll_update(tcp->notify);
-        spin_unlock(&tcp->notify_lock);
+        exasock_epoll_update(&tcp->notify);
 
         /* Remove from incomplete connections */
         hlist_del(&req->hash_node);
@@ -1878,6 +2705,7 @@ static bool exasock_tcp_process_packet(struct sk_buff *skb)
         ret = exasock_tcp_conn_process(skb, tcp, th, data, datalen);
 
     kref_put(&tcp->refcount, exasock_tcp_dead);
+
     return ret == 0;
 
 drop_packet:
@@ -1889,6 +2717,7 @@ static void exasock_tcp_rx_worker(struct work_struct *work)
 {
     struct sk_buff *skb;
     struct sk_buff_head tmp_queue;
+    unsigned long irqflags;
 
     skb_queue_head_init(&tmp_queue);
 
@@ -1901,9 +2730,13 @@ static void exasock_tcp_rx_worker(struct work_struct *work)
 
     /* Add a delay before running worker again */
     if (!skb_queue_empty(&tmp_queue))
+    {
         queue_delayed_work(tcp_workqueue, &tcp_rx_work, 1);
+    }
 
+    spin_lock_irqsave(&tcp_packets.lock, irqflags);
     skb_queue_splice(&tmp_queue, &tcp_packets);
+    spin_unlock_irqrestore(&tcp_packets.lock, irqflags);
 }
 
 static void exasock_tcp_conn_worker(struct work_struct *work)
@@ -1912,6 +2745,7 @@ static void exasock_tcp_conn_worker(struct work_struct *work)
     struct exa_socket_state *state = tcp->user_page;
     uint32_t send_ack, send_seq;
     uint8_t tcp_state;
+    bool ack_sent = false;
 
     rcu_read_lock();
     if (tcp->dead_node)
@@ -1930,13 +2764,31 @@ static void exasock_tcp_conn_worker(struct work_struct *work)
     if (tcp->retransmit_countdown > 0)
         tcp->retransmit_countdown--;
 
-    if (tcp_state == EXA_TCP_CLOSED || tcp_state == EXA_TCP_LISTEN)
+    if (tcp_state != EXA_TCP_TIME_WAIT)
+        tcp->timewait_countdown = -1;
+
+    /* reset timewait counter if our last ack was lost */
+    if (tcp->timewait_dupfin == true)
+    {
+        tcp->timewait_dupfin = false;
+        tcp->timewait_countdown = TIMEWAIT_TIMEOUT;
+    }
+    else if (tcp->timewait_countdown > 0)
+        tcp->timewait_countdown--;
+    else if (tcp_state == EXA_TCP_TIME_WAIT)
+        tcp->timewait_countdown = TIMEWAIT_TIMEOUT;
+
+    tcp->last_ack_counter++;
+
+    if (tcp_state == EXA_TCP_CLOSED || tcp_state == EXA_TCP_LISTEN ||
+        tcp_state == EXA_TCP_TIME_WAIT)
     {
         /* No retransmissions in these states */
         tcp->retransmit_countdown = -1;
     }
     else if (tcp_state == EXA_TCP_SYN_RCVD || tcp_state == EXA_TCP_SYN_SENT ||
-             tcp_state == EXA_TCP_FIN_WAIT_1)
+             tcp_state == EXA_TCP_FIN_WAIT_1 || tcp_state == EXA_TCP_LAST_ACK ||
+             tcp_state == EXA_TCP_CLOSING)
     {
         /* ACKs are pending from the remote host */
         if (tcp->retransmit_countdown == -1)
@@ -1944,7 +2796,13 @@ static void exasock_tcp_conn_worker(struct work_struct *work)
             tcp->retransmit_countdown = RETRANSMIT_TIMEOUT;
         }
     }
-    else if (send_ack != send_seq)
+    /*
+     * Note: after having transmitted all payload bytes, send_seq stops
+     *       updating, but send_ack continues to update as new acks
+     *       arrive, hence the separate cases
+     */
+    else if (!(tcp_state == EXA_TCP_ESTABLISHED && after_eq(send_ack, send_seq)) &&
+             !(tcp_state == EXA_TCP_FIN_WAIT_2 && send_ack == send_seq + 1))
     {
         /* ACKs are pending from the remote host, reset retransmit countdown
          * if it is not set, or if progress has been made */
@@ -1953,12 +2811,49 @@ static void exasock_tcp_conn_worker(struct work_struct *work)
         {
             tcp->retransmit_countdown = RETRANSMIT_TIMEOUT;
         }
+
+        /* By getting into this if clause, we have outstanding un-ACKed
+         * data. So, if tcp->last_send_ack == send_ack, then we haven't seen
+         * ACK progress despite having data. We've already moved the "last ack
+         * counter" forward, so check that the timeout has been reached. */
+        if (state->p.tcp.user_timeout_ms != 0
+            && tcp->last_send_ack == send_ack
+            && (tcp->last_ack_counter * 1000 / TCP_TIMER_PER_SEC
+                >= state->p.tcp.user_timeout_ms))
+        {
+            state->error = ETIMEDOUT;
+            state->p.tcp.state = EXA_TCP_CLOSED;
+        }
     }
     else
     {
-        /* No ACKs pending, disable timeout */
+        /* No ACKs pending, disable timeouts */
         tcp->retransmit_countdown = -1;
+        tcp->last_ack_counter = 0;
     }
+
+    if (tcp->timewait_countdown == 0)
+    {
+        state->p.tcp.state = EXA_TCP_CLOSED;
+    }
+
+    exasock_tcp_check_dup_acks_pending(tcp, state);
+
+    if (state->p.tcp.ss_after_idle &&
+        send_ack == send_seq &&
+        tcp->last_send_seq == send_seq)
+    {
+        /* Connection is idle, returns congestion control to slow-start state */
+        state->p.tcp.cwnd = 3 * EXA_TCP_MSS;
+    }
+
+    /* ack has progressed, clear last ack counter */
+    if (tcp->last_send_ack != send_ack)
+    {
+        tcp->last_ack_counter = 0;
+        tcp->last_send_ack = send_ack;
+    }
+    tcp->last_send_seq = send_seq;
 
     if (tcp->retransmit_countdown == 0)
     {
@@ -1969,21 +2864,17 @@ static void exasock_tcp_conn_worker(struct work_struct *work)
     }
     else if (state->p.tcp.ack_pending)
     {
+        /* For ATE connections this will also update ATE state, so
+         * ACK should not be generated sooner than once all cwnd updates
+         * are already done. */
         exasock_tcp_send_ack(tcp, false);
+        ack_sent = true;
     }
+
+    if (tcp->ate.active && !ack_sent)
+        exasock_ate_update(tcp);
 
     exasock_tcp_check_dup_acks_pending(tcp, state);
-
-    if (state->p.tcp.ss_after_idle &&
-        send_ack == send_seq && 
-        tcp->last_send_seq == send_seq)
-    {
-        /* Connection is idle, returns congestion control to slow-start state */
-        state->p.tcp.cwnd = 3 * EXA_TCP_MSS;
-    }
-
-    tcp->last_send_ack = send_ack;
-    tcp->last_send_seq = send_seq;
 
     /* Check if window update monitoring has expired */
     if (tcp->win_work_on > 0)
@@ -1994,12 +2885,48 @@ static void exasock_tcp_conn_worker(struct work_struct *work)
     }
 
     if ((tcp_state != EXA_TCP_CLOSED) && (tcp_state != EXA_TCP_LISTEN) &&
-        (tcp_state != EXA_TCP_SYN_SENT) && (tcp_state != EXA_TCP_SYN_RCVD))
+        (tcp_state != EXA_TCP_SYN_SENT) && (tcp_state != EXA_TCP_SYN_RCVD) &&
+        (tcp_state != EXA_TCP_TIME_WAIT))
     {
+        /* Check keep-alive counters */
+        if (tcp->keepalive.timer > 0)
+        {
+            tcp->keepalive.timer--;
+            if (tcp->keepalive.timer == 0)
+            {
+                if (tcp->keepalive.probe_cnt < state->p.tcp.keepalive.probes)
+                {
+                    /* Send keep-alive probe */
+                    exasock_tcp_send_probe(tcp);
+                    tcp->keepalive.probe_cnt++;
+                    tcp->keepalive.timer = state->p.tcp.keepalive.intvl *
+                                           TCP_TIMER_PER_SEC;
+                }
+                else
+                {
+                    /* Connection timed out, move to CLOSED state */
+                    state->error = ETIMEDOUT;
+                    state->p.tcp.state = EXA_TCP_CLOSED;
+
+                    /* TODO: Flush send and receive buffers */
+                }
+            }
+        }
+
+        /* Update stats */
         exasock_tcp_counters_update(&tcp->counters, &state->p.tcp);
     }
 
-    queue_delayed_work(tcp_workqueue, &tcp->work, TCP_TIMER_JIFFIES);
+    /*
+     * if connection is shut down and user has called close(),
+     * then schedule the close worker to run again to perform cleanup
+     */
+    if (tcp->user_page->p.tcp.state == EXA_TCP_CLOSED &&
+        tcp->user_closed)
+        exasock_tcp_free(tcp);
+    else if (!module_removed)
+        queue_delayed_work(tcp_workqueue, &tcp->work, TCP_TIMER_JIFFIES);
+
     kref_put(&tcp->refcount, exasock_tcp_dead);
 }
 
@@ -2026,7 +2953,7 @@ static void exasock_tcp_conn_win_worker(struct work_struct *work)
     /* Continue monitoring only if there is still no space in the window */
     if (exasock_tcp_calc_window(tcp, state->p.tcp.recv_seq) > 0)
         tcp->win_work_on = 0;
-    else
+    else if (!module_removed)
         queue_delayed_work(tcp_workqueue, &tcp->win_work, 1);
 
     kref_put(&tcp->refcount, exasock_tcp_dead);
@@ -2137,11 +3064,17 @@ static void exasock_tcp_send_segment(struct exasock_tcp *tcp, uint32_t seq,
         th->seq = htonl(seq);
         th->ack_seq = htonl(recv_seq);
         th->ack = 1;
+        data_allowed = true;
         break;
 
     case EXA_TCP_CLOSING:
-        /* Send ACK for remote FIN */
+        /*
+         * send ack for remote fin
+         * or retransmit fin
+         */
         th->seq = htonl(seq);
+        if (send_seq == seq)
+            th->fin = 1;
         th->ack_seq = htonl(recv_seq + 1);
         th->ack = 1;
         data_allowed = true;
@@ -2151,14 +3084,15 @@ static void exasock_tcp_send_segment(struct exasock_tcp *tcp, uint32_t seq,
         /* Send FIN */
         th->seq = htonl(seq);
         th->ack_seq = htonl(recv_seq + 1);
-        th->fin = 1;
+        if (send_seq == seq)
+            th->fin = 1;
         th->ack = 1;
         data_allowed = true;
         break;
 
     case EXA_TCP_TIME_WAIT:
         /* Send ACK for remote FIN */
-        th->seq = htonl(send_seq + 1);
+        th->seq = htonl(seq);
         th->ack_seq = htonl(recv_seq + 1);
         th->ack = 1;
         break;
@@ -2235,21 +3169,25 @@ static void exasock_tcp_retransmit(struct exasock_tcp *tcp, bool fast_retrans)
     uint8_t tcp_state = state->p.tcp.state;
     uint32_t len;
 
+    bool fin_retransmit = (send_ack == send_seq) &&
+        (tcp_state == EXA_TCP_FIN_WAIT_1 || tcp_state == EXA_TCP_LAST_ACK ||
+         tcp_state == EXA_TCP_CLOSING);
+
     if (tcp_state == EXA_TCP_SYN_RCVD || tcp_state == EXA_TCP_SYN_SENT)
     {
         /* Data retransmissions are only allowed in a synchronised state */
         len = 0;
     }
+    else if (fin_retransmit)
+    {
+        len = 0;
+    }
     else
     {
-        len = send_seq - send_ack;
-
-        if (len == 0)
+        if (after_eq(send_ack, send_seq))
             return;
 
-        if (len > EXA_TCP_MSS)
-            len = EXA_TCP_MSS;
-
+        len = send_seq - send_ack;
         if (len > rmss)
             len = rmss;
     }
@@ -2261,15 +3199,24 @@ static void exasock_tcp_retransmit(struct exasock_tcp *tcp, bool fast_retrans)
         tcp->counters.s.conn.retrans_segs_fast++;
     else
         tcp->counters.s.conn.retrans_segs_to++;
-
     exasock_tcp_send_segment(tcp, send_ack, len, false);
 }
 
 static void exasock_tcp_send_ack(struct exasock_tcp *tcp, bool dup)
 {
-    struct exa_socket_state *state = tcp->user_page;
-
-    exasock_tcp_send_segment(tcp, state->p.tcp.send_seq, 0, dup);
+    if (tcp->ate.active && !tcp->ate.tx_disabled)
+        exasock_ate_send_ack(tcp, dup);
+    else
+    {
+        struct exa_socket_state *state = tcp->user_page;
+        uint32_t seq = state->p.tcp.send_seq;
+        if (state->p.tcp.state == EXA_TCP_TIME_WAIT ||
+            state->p.tcp.state == EXA_TCP_CLOSING)
+        {
+            seq++;
+        }
+        exasock_tcp_send_segment(tcp, seq, 0, dup);
+    }
 }
 
 static void exasock_tcp_send_reset(struct exasock_tcp *tcp)
@@ -2280,8 +3227,12 @@ static void exasock_tcp_send_reset(struct exasock_tcp *tcp)
     uint8_t tcp_state;
     uint32_t send_seq, recv_seq;
 
+    if (tcp->ate.active)
+        send_seq = exasock_ate_read_seq(tcp);
+    else
+        send_seq = state->p.tcp.send_seq;
+
     tcp_state = state->p.tcp.state;
-    send_seq = state->p.tcp.send_seq;
     recv_seq = state->p.tcp.recv_seq;
 
     skb = alloc_skb(MAX_TCP_HEADER, GFP_KERNEL);
@@ -2381,72 +3332,22 @@ static void exasock_tcp_send_syn_ack(struct exasock_tcp_req *req)
     exasock_ip_send(IPPROTO_TCP, req->peer_addr, req->local_addr, skb);
 }
 
-int exasock_tcp_notify_add(uint32_t local_addr, uint16_t local_port,
-                           struct exasock_epoll_notify *notify)
+static void exasock_tcp_send_probe(struct exasock_tcp *tcp)
 {
-    struct exasock_tcp *tcp;
-    int ret = 0;
+    struct exa_socket_state *state = tcp->user_page;
 
-    /* Look up socket */
-    rcu_read_lock();
-    tcp = exasock_tcp_listen_lookup(local_addr, local_port);
-    if (tcp == NULL)
-    {
-        rcu_read_unlock();
-        return -ENOENT;
-    }
-    kref_get(&tcp->refcount);
-    rcu_read_unlock();
-
-    spin_lock(&tcp->notify_lock);
-
-    if (tcp->notify != NULL)
-    {
-        /* This socket is already a member of an epoll */
-        ret = -EINVAL;
-        goto exit;
-    }
-    tcp->notify = notify;
-
-exit:
-    spin_unlock(&tcp->notify_lock);
-    kref_put(&tcp->refcount, exasock_tcp_dead);
-    return ret;
+    exasock_tcp_send_segment(tcp, state->p.tcp.send_ack - 1, 0, false);
 }
 
-int exasock_tcp_notify_del(uint32_t local_addr, uint16_t local_port,
-                           struct exasock_epoll_notify **notify)
+int exasock_tcp_epoll_add(struct exasock_tcp *tcp, struct exasock_epoll *epoll,
+                          int fd)
 {
-    struct exasock_tcp *tcp;
-    int ret = 0;
+    return exasock_epoll_notify_add(epoll, &tcp->notify, fd);
+}
 
-    /* Look up socket */
-    rcu_read_lock();
-    tcp = exasock_tcp_listen_lookup(local_addr, local_port);
-    if (tcp == NULL)
-    {
-        *notify = NULL;
-        rcu_read_unlock();
-        return -ENOENT;
-    }
-    kref_get(&tcp->refcount);
-    rcu_read_unlock();
-
-    spin_lock(&tcp->notify_lock);
-
-    *notify = tcp->notify;
-    if (tcp->notify == NULL)
-    {
-        spin_unlock(&tcp->notify_lock);
-        ret = -EINVAL;
-        goto exit;
-    }
-    tcp->notify = NULL;
-
-exit:
-    spin_unlock(&tcp->notify_lock);
-    kref_put(&tcp->refcount, exasock_tcp_dead);
-    return ret;
+int exasock_tcp_epoll_del(struct exasock_tcp *tcp, struct exasock_epoll *epoll)
+{
+    return exasock_epoll_notify_del_check(epoll, &tcp->notify);
 }
 
 int exasock_tcp_setsockopt(struct exasock_tcp *tcp, int level, int optname,
@@ -2458,7 +3359,10 @@ int exasock_tcp_setsockopt(struct exasock_tcp *tcp, int level, int optname,
     BUG_ON(tcp->hdr.socket.domain != AF_INET);
     BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
 
-    ret = tcp->sock->ops->setsockopt(tcp->sock, level, optname, optval, optlen);
+    if (level == SOL_SOCKET)
+        ret = sock_setsockopt(tcp->sock, level, optname, USER_SOCKPTR(optval), optlen);
+    else
+        ret = tcp->sock->ops->setsockopt(tcp->sock, level, optname, USER_SOCKPTR(optval), optlen);
 
     return ret;
 }
@@ -2466,38 +3370,83 @@ int exasock_tcp_setsockopt(struct exasock_tcp *tcp, int level, int optname,
 int exasock_tcp_getsockopt(struct exasock_tcp *tcp, int level, int optname,
                            char __user *optval, unsigned int *optlen)
 {
-    int ret;
-    mm_segment_t old_fs;
-
     BUG_ON(tcp->hdr.type != EXASOCK_TYPE_SOCKET);
     BUG_ON(tcp->hdr.socket.domain != AF_INET);
     BUG_ON(tcp->hdr.socket.type != SOCK_STREAM);
 
-    old_fs = get_fs();
-    set_fs(KERNEL_DS);
-    ret = tcp->sock->ops->getsockopt(tcp->sock, level, optname, optval, optlen);
-    set_fs(old_fs);
-
-    return ret;
+    return tcp->sock->ops->getsockopt(tcp->sock, level, optname, optval, optlen);
 }
 
 int __init exasock_tcp_init(void)
 {
+    int err = 0;
     tcp_buckets = kzalloc(NUM_BUCKETS * sizeof(*tcp_buckets), GFP_KERNEL);
+    if (tcp_buckets == NULL)
+        return -ENOMEM;
+
     tcp_req_buckets = kzalloc(NUM_BUCKETS * sizeof(*tcp_req_buckets), GFP_KERNEL);
+    if (tcp_req_buckets == NULL)
+    {
+        err = -ENOMEM;
+        goto req_buckets_null;
+    }
+
     skb_queue_head_init(&tcp_packets);
+
     tcp_workqueue = create_singlethread_workqueue("exasock_tcp");
+    if (tcp_workqueue == NULL)
+    {
+        err = -ENOMEM;
+        goto main_wq_null;
+    }
+
+    tcp_gc_workqueue = create_workqueue("exasock_tcp_gc");
+    if (tcp_gc_workqueue == NULL)
+    {
+        err = -ENOMEM;
+        goto gc_wq_null;
+    }
+
     INIT_DELAYED_WORK(&tcp_rx_work, exasock_tcp_rx_worker);
     INIT_DELAYED_WORK(&tcp_req_work, exasock_tcp_req_worker);
     queue_delayed_work(tcp_workqueue, &tcp_req_work, TCP_TIMER_JIFFIES);
-    return exanic_netdev_intercept_add(&exasock_tcp_intercept);
+
+    err = exanic_netdev_intercept_add(&exasock_tcp_intercept);
+    if (err)
+        goto intercept_failed;
+
+    skb_queue_head_init(&ate_packets);
+    INIT_WORK(&ate_skb_proc_work, exasock_ate_skb_proc_worker);
+
+    err = exanic_ate_client_register(&exasock_ate_process_skb);
+    if (err)
+        goto err_ate_client_register;
+
+    return 0;
+err_ate_client_register:
+    exanic_netdev_intercept_remove(&exasock_tcp_intercept);
+intercept_failed:
+    cancel_delayed_work_sync(&tcp_req_work);
+    flush_workqueue(tcp_workqueue);
+    destroy_workqueue(tcp_gc_workqueue);
+gc_wq_null:
+    destroy_workqueue(tcp_workqueue);
+main_wq_null:
+    kfree(tcp_req_buckets);
+req_buckets_null:
+    kfree(tcp_buckets);
+
+    return err;
 }
 
 void exasock_tcp_exit(void)
 {
+    exanic_ate_client_unregister(&exasock_ate_process_skb);
+    skb_queue_purge(&ate_packets);
     exanic_netdev_intercept_remove(&exasock_tcp_intercept);
     cancel_delayed_work_sync(&tcp_req_work);
     flush_workqueue(tcp_workqueue);
+    exasock_tcp_kill_stray();
     destroy_workqueue(tcp_workqueue);
     skb_queue_purge(&tcp_packets);
     kfree(tcp_req_buckets);

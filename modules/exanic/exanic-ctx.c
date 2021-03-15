@@ -53,24 +53,24 @@ void exanic_free_ctx(struct exanic_ctx *ctx)
     struct exanic *exanic = ctx->exanic;
     struct device *dev = &exanic->pci_dev->dev;
     int i;
-    struct exanic_filter_buffer_ref *ref; 
+    struct exanic_filter_buffer_ref *ref;
     struct list_head *pos, *pos_next;
+
     /* Deallocate TX region and feedback slots associated with this fd */
     bitmap_andnot(exanic->tx_region_bitmap, exanic->tx_region_bitmap,
             ctx->tx_region_bitmap, EXANIC_TX_REGION_MAX_NUM_PAGES);
     bitmap_andnot(exanic->tx_feedback_bitmap, exanic->tx_feedback_bitmap,
             ctx->tx_feedback_bitmap, EXANIC_TX_FEEDBACK_NUM_SLOTS);
 
-
     /* Free any filter DMA buffers. */
     list_for_each_safe(pos, pos_next, &ctx->filter_buffer_ref_list)
     {
         ref = list_entry(pos, struct exanic_filter_buffer_ref,
                          list);
-        exanic_free_filter_dma(exanic, ref->port, ref->buffer); 
+        exanic_free_filter_dma(exanic, ref->port, ref->buffer);
         list_del(pos);
         kfree(ref);
-    } 
+    }
 
     /* Decrement RX reference counts */
     for (i = 0; i < exanic->num_ports; ++i)
@@ -208,12 +208,10 @@ int exanic_alloc_tx_feedback(struct exanic_ctx *ctx, unsigned port_num,
 {
     struct exanic *exanic = ctx->exanic;
     struct device *dev = &exanic->pci_dev->dev;
-    size_t start = port_num * (EXANIC_TX_FEEDBACK_NUM_SLOTS / EXANIC_MAX_PORTS);
-    size_t end = start + (EXANIC_TX_FEEDBACK_NUM_SLOTS / EXANIC_MAX_PORTS);
     unsigned slot;
 
-    slot = find_next_zero_bit(exanic->tx_feedback_bitmap, end, start);
-    if (slot >= end)
+    slot = find_first_zero_bit(exanic->tx_feedback_bitmap, EXANIC_TX_FEEDBACK_NUM_SLOTS);
+    if (slot == EXANIC_TX_FEEDBACK_NUM_SLOTS)
     {
         dev_err(dev, DRV_NAME
             "%u: Failed to allocate TX feedback slot.\n", exanic->id);

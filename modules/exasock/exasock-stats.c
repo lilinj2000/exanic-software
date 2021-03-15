@@ -41,11 +41,16 @@ static int exasock_genl_register_family(struct genl_family *family,
     }
     return 0;
 }
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-    #define exasock_genl_register_family(family, ops, size) \
-        genl_register_family(family)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0) \
+    || !defined(GENL_ID_GENERATE)
+    /* ideally we could just use the "kernel > 4.10" check, but RHEL7.5
+     * backports the static genl_id change to kernel 3.10.x, breaking that
+     * check.
+     */
     #define __HAS_STATIC_GENL_INIT
     #define __HAS_NO_STATIC_GENL_ID
+    #define exasock_genl_register_family(family, ops, size) \
+        genl_register_family(family)
 #elif (LINUX_VERSION_CODE < KERNEL_VERSION(3, 13, 0)) && \
        !defined(genl_register_family_with_ops)
     #define exasock_genl_register_family(family, ops, size) \
@@ -738,12 +743,16 @@ static struct genl_ops exasock_genl_ops[] =
     {
         .cmd    = EXASOCK_GENL_C_GET_SOCKLIST,
         .doit   = exasock_genl_cmd_get_socklist,
+#if __HAS_GENL_POLICY_IN_OPS
         .policy = exasock_genl_policy,
+#endif
     },
     {
         .cmd    = EXASOCK_GENL_C_GET_SOCKET,
         .doit   = exasock_genl_cmd_get_socket,
+#if __HAS_GENL_POLICY_IN_OPS
         .policy = exasock_genl_policy,
+#endif
     },
 };
 
@@ -761,6 +770,10 @@ static struct genl_family exasock_genl_family =
     .module     = THIS_MODULE,
     .ops        = exasock_genl_ops,
     .n_ops      = ARRAY_SIZE(exasock_genl_ops),
+#endif
+
+#if !__HAS_GENL_POLICY_IN_OPS
+    .policy     = exasock_genl_policy,
 #endif
 };
 

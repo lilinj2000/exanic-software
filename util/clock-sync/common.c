@@ -378,7 +378,8 @@ enum phc_source get_phc_source(int clkfd, exanic_t *exanic)
     struct stat st;
     int i;
 
-    if (exanic != NULL && exanic_get_hw_type(exanic) == EXANIC_HW_X10_GM)
+    if (exanic != NULL &&
+        (exanic->hw_info.flags & EXANIC_HW_FLAG_GPS))
     {
         uint32_t conf0;
 

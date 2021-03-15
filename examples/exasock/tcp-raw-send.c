@@ -1,3 +1,26 @@
+/*
+ * This program demonstrates the use of the Exasock extensions API. It retrieves a
+ * raw TCP header from an accelerated socket, construct a TCP segment manually and
+ * sends it via the raw API (libexanic).
+ *
+ * Example usage:
+ *
+ *   exasock ./tcp-raw-send 192.168.1.11 11111
+ *
+ * This will listen for TCP connections on the interface with address 192.168.1.11
+ * and port 11111. After a connection is accepted, any received packets will be
+ * echoed by manually constructing the next TCP segment and transmitting it via
+ * the raw ethernet frame API (libexanic).
+ *
+ * The extensions API is useful for performing TCP transmission from outside of
+ * standard sockets, for example, from the ExaNIC FPGA or by preloading the
+ * transmit buffers on the card.
+ *
+ * Note that if run without Exasock this example will fail, as the Exasock
+ * extensions API function stubs will not have been replaced with the versions
+ * that are preloaded via the Exasock wrapper.
+ */
+
 #include <poll.h>
 #include <errno.h>
 #include <stdio.h>
@@ -21,6 +44,7 @@ int main(int argc, char *argv[])
     ssize_t len, hdrlen;
     exanic_t *exanic;
     exanic_tx_t *tx;
+    const char *verstring;
 
     /* Parse command line arguments */
 
@@ -41,6 +65,21 @@ int main(int argc, char *argv[])
         fprintf(stderr, "This program should be run with exasock.\n");
         return EXIT_FAILURE;
     }
+
+    verstring = exasock_version_text();
+    if (verstring == NULL)
+    {
+        fprintf (stderr, "Failed to obtain Exasock version text.\n");
+        return EXIT_FAILURE;
+    }
+
+    /* Will not happen, only to demonstrate usage */
+    if (exasock_version_code() < EXASOCK_VERSION(2,2,0))
+    {
+        fprintf(stderr, "Please install Exasock library 2.2.0 or newer.\n");
+        return EXIT_FAILURE;
+    }
+    printf("Exasock release %s\n", verstring);
 
     /* Listen for connection */
 
