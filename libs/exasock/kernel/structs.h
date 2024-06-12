@@ -49,7 +49,7 @@ struct exa_udp_state
 #define EXA_TCP_TIME_WAIT               10
 
 #define EXA_TCP_MAX_RX_SEGMENTS         6
-
+#define EXA_SOMAXCONN                   128
 /*
  * Locking in TCP state structs
  *
@@ -66,6 +66,71 @@ struct exa_udp_state
  * - Updating read_seq, recv_seq and send_ack
  * - Reading or updating recv_seg
  */
+
+#ifdef TCP_LISTEN_SOCKET_PROFILING
+#define NUM_PROFILE_CONNECTIONS 1000
+
+struct tcp_timestamp
+{
+    long tv_sec;
+    long tv_nsec;
+};
+
+struct tcp_packet_event
+{
+    uint16_t flags;
+    uint32_t ack;
+    uint32_t seq;
+};
+
+struct tcp_state_event
+{
+    struct tcp_packet_event pkt_event;
+    uint8_t rx:1,
+            tx:1,
+            close:1,
+            shutdown:1;
+    int state;
+    /* whether event originated from kernel module
+     * or from exasock library */
+    bool kernel;
+    uint32_t line;
+    char fname[25];
+    struct tcp_timestamp ts;
+};
+
+
+struct tcp_socket_profile
+{
+    uint16_t local_port;
+    uint16_t peer_port;
+    struct tcp_timestamp establishment_period;
+    struct tcp_timestamp pending_period;
+    struct tcp_timestamp handshake_period;
+    struct tcp_timestamp accept_period;
+
+    uint32_t queue_len;
+    uint32_t num_packets;
+    uint32_t trylock_failed;
+    uint32_t fins_dropped;
+    uint32_t init_local_seq;
+    uint32_t init_peer_seq;
+    struct tcp_state_event st_history[10];
+    int event_index;
+    bool overflow;
+    bool valid;
+};
+
+struct listen_socket_profile_info
+{
+    uint32_t conns_accepted;
+    uint32_t syn_received;
+    uint32_t conns_dropped;
+    uint32_t lock;
+    uint32_t index;
+    struct tcp_socket_profile conns[NUM_PROFILE_CONNECTIONS];
+};
+#endif /* ifdef TCP_LISTEN_SOCKET_PROFILING */
 
 struct exa_tcp_state
 {
@@ -166,6 +231,13 @@ struct exa_tcp_state
     uint8_t wscale;
     /* TCP connection state */
     uint8_t state;
+    /* backlog from listen call, applicable only for listen sockets */
+    int backlog;
+
+#ifdef TCP_LISTEN_SOCKET_PROFILING
+    struct tcp_socket_profile profile;
+#endif /* ifdef TCP_LISTEN_SOCKET_PROFILING */
+
     /* Keep-alive settings */
     struct {
         uint32_t time;
@@ -276,7 +348,19 @@ struct exa_udp_queue_ftr
     uint32_t hw_ts_nsec;
 };
 
-/* Entry is created after a new connection moves to the ESTABLISHED state */
+/* Add header and footer size and align to next 64 byte boundary */
+static inline size_t
+exa_udp_queue_entry_size(size_t len)
+{
+    return (len + sizeof(struct exa_udp_queue_hdr) +
+            sizeof(struct exa_udp_queue_ftr) + 63) & ~63;
+}
+
+/* Entry is created after a new connection moves to the ESTABLISHED state.
+ * Attention!!! Please make sure that after addition/removal of fields the
+ * size of the struct is a power-of-2 size.  If the size of the struct needs
+ * to be increased use the __reserved field.
+ */
 struct exa_tcp_new_connection
 {
     uint32_t local_addr;
@@ -296,7 +380,7 @@ struct exa_tcp_new_connection
     uint16_t peer_wscale;
 
     /* Pad to power of 2 size */
-    uint32_t __reserved[2];
+    uint32_t __reserved[1];
 };
 
 #define EXASOCK_EPOLL_FD_READY_RING_SIZE 512    /* Must be a power of 2 */

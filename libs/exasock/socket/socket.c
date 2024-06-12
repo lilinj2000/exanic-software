@@ -1211,8 +1211,16 @@ getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     if (sock != NULL && sock->bypass_state == EXA_BYPASS_ACTIVE)
     {
         exa_read_lock(&sock->lock);
-
-        if (!sock->connected)
+        if (sock->type == SOCK_DGRAM && !sock->connected)
+        {
+            errno = ENOTCONN;
+            ret = -1;
+        }
+        /* if socket is tcp then check tcp socket state directly, 
+           do not rely on connected flag. It is set as soon as connection
+           is in progress and not when it is actually connected */
+        else if (sock->type == SOCK_STREAM &&
+                (exanic_tcp_connecting(sock) || exanic_tcp_write_closed(sock)))
         {
             errno = ENOTCONN;
             ret = -1;
@@ -1776,23 +1784,19 @@ setsockopt_ip(struct exa_socket * restrict sock, int sockfd, int optname,
     case IP_DROP_MEMBERSHIP:
         if (is_exanic && sock->bypass_state >= EXA_BYPASS_AVAIL)
         {
-            struct exa_mcast_membership *deltmp;
-
-            deltmp = exa_socket_ip_memberships_remove(sock, &mcast_ep);
-            assert(deltmp != NULL);
-
             if (sock->bound)
             {
+                /* First remove hashtable entry and then remove membership
+                 * from the linked list of memberships and free its memory
+                 */
                 ret = exa_socket_del_mcast(sock, &mcast_ep);
                 if (ret == -1)
                 {
-                    exa_socket_ip_memberships_free(deltmp);
+                    exa_socket_ip_memberships_remove_and_free(sock, &mcast_ep);
                     goto err_exit;
                 }
             }
-
-
-            exa_socket_ip_memberships_free(deltmp);
+            exa_socket_ip_memberships_remove_and_free(sock, &mcast_ep);
         }
         else
         {

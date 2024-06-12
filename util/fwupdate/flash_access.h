@@ -18,14 +18,20 @@ struct flash_device
     exanic_t *exanic;
     struct flash_ops *ops;
     bool is_recovery;
+    flash_size_t device_size;
     flash_address_t partition_start;
     flash_size_t partition_size;
-    flash_size_t block_size;
+    flash_size_t main_block_size;
+    flash_size_t region_1_block_size;
+    flash_address_t region_2_start;
+    flash_size_t region_2_block_size;
+    flash_address_t region_3_start;
+    flash_size_t region_3_block_size;
     flash_size_t burst_buffer_size;
     flash_size_t min_read_size;
-    flash_size_t boot_area_block_size;
-    flash_address_t boot_area_start;
     uint32_t status;
+    bool bit_reverse_bitstream;
+    bool supports_unlock_bypass;
 };
 
 struct flash_ops

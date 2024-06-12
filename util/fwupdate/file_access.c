@@ -57,7 +57,7 @@ static bool get_uint32_be(FILE *fp, uint32_t *val)
 
 static uint8_t *get_field(FILE *fp, size_t length)
 {
-    uint8_t *data = malloc(length);
+    uint8_t *data = (uint8_t *) malloc(length);
     if (!data)
     {
         fprintf(stderr, "ERROR: malloc failed\n");
@@ -76,20 +76,23 @@ static uint8_t *get_field(FILE *fp, size_t length)
     return data;
 }
 
-static flash_word_t *bytes_to_flash_words(uint8_t *buf, size_t size_bytes, flash_size_t *size)
+static flash_word_t *bytes_to_flash_words(uint8_t *buf, size_t size_bytes, bool bit_reverse, flash_size_t *size)
 {
     size_t offset;
-    for (offset = 0; offset < size_bytes; offset += 2)
+    if (bit_reverse)
     {
-        uint8_t b0 = bit_reverse_table[buf[offset]];
-        uint8_t b1 = bit_reverse_table[buf[offset+1]];
-        *(uint16_t *)(&buf[offset]) = (b0 << 8) | b1;
+        for (offset = 0; offset < size_bytes; offset += 2)
+        {
+            uint8_t b0 = bit_reverse_table[buf[offset]];
+            uint8_t b1 = bit_reverse_table[buf[offset+1]];
+            *(uint16_t *)(&buf[offset]) = (b0 << 8) | b1;
+        }
     }
     *size = size_bytes >> 1;
     return (flash_word_t *)buf;
 }
 
-static flash_word_t *read_bit_file(FILE *fp, flash_size_t partition_size,
+static flash_word_t *read_bit_file(FILE *fp, flash_size_t partition_size, bool bit_reverse,
                                    flash_size_t *data_size, const char **firmware_id)
 {
     size_t partition_size_bytes = partition_size<<1;
@@ -124,7 +127,7 @@ static flash_word_t *read_bit_file(FILE *fp, flash_size_t partition_size,
                 if (!build_info)
                     return NULL;
                 /* use first field of build information as firmware ID */
-                delimiter = memchr(build_info, ';', field_length);
+                delimiter = (char *) memchr(build_info, ';', field_length);
                 if (!delimiter)
                 {
                     fprintf(stderr, "ERROR: unexpected build info read from bitstream: %.*s\n",
@@ -170,7 +173,7 @@ static flash_word_t *read_bit_file(FILE *fp, flash_size_t partition_size,
     }
 
     bytes = get_field(fp, data_length);
-    return bytes_to_flash_words(bytes, data_length, data_size);
+    return bytes_to_flash_words(bytes, data_length, bit_reverse, data_size);
 }
 
 
@@ -234,7 +237,7 @@ static flash_word_t *read_fw_file(FILE *fp, flash_size_t partition_size,
         *delimiter = 0;
     *firmware_id = strdup(&line[1]);
 
-    flash_data = malloc(partition_size*sizeof(flash_word_t));
+    flash_data = (flash_word_t *) malloc(partition_size*sizeof(flash_word_t));
     if (!flash_data)
     {
         fprintf(stderr, "ERROR: malloc failed\n");
@@ -254,7 +257,7 @@ static flash_word_t *read_fw_file(FILE *fp, flash_size_t partition_size,
              || !parse_hex_byte(&line[5], &line_address_lo)
              || !parse_hex_byte(&line[7], &type)
              || (bytes > sizeof(data))
-             || (line_len < 11+2*bytes)
+             || (line_len < 11u+2u*bytes)
              || !parse_hex_byte(&line[9+2*bytes], &checksum))
         {
             fprintf(stderr, "ERROR: parse error on line %u\n", line_number);
@@ -329,7 +332,7 @@ static flash_word_t *read_gz_file(const char *filename, flash_size_t partition_s
     FILE *pipefp;
     uint16_t *ret;
 
-    pipecmd = malloc(cmdlen);
+    pipecmd = (char *) malloc(cmdlen);
     if (pipecmd == NULL)
     {
         fprintf(stderr, "ERROR: malloc failed\n");
@@ -351,7 +354,8 @@ static flash_word_t *read_gz_file(const char *filename, flash_size_t partition_s
 
 
 flash_word_t *read_firmware(const char *filename, flash_size_t partition_size,
-                            flash_size_t *data_size, const char **firmware_id)
+                            bool bit_reverse_bitstream, flash_size_t *data_size,
+                            const char **firmware_id)
 {
     FILE *fp;
     uint16_t *ret;
@@ -380,7 +384,8 @@ flash_word_t *read_firmware(const char *filename, flash_size_t partition_size,
             ret = read_gz_file(filename, partition_size, data_size, firmware_id);
             break;
         default:
-            ret = read_bit_file(fp, partition_size, data_size, firmware_id);
+            ret = read_bit_file(fp, partition_size, bit_reverse_bitstream,
+                                data_size, firmware_id);
     }
     fclose(fp);
     if (ret == NULL)

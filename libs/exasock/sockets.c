@@ -42,6 +42,7 @@
 #include "sys.h"
 #include "dst.h"
 #include "notify.h"
+#include "socket/common.h"
 
 void
 exa_socket_zero(struct exa_socket * restrict sock)
@@ -142,7 +143,7 @@ exa_socket_ip_memberships_get_denominator_iface(struct exa_socket *esk)
      * if the unicast iface address is different from the mcast
      * denominator iface address.
      */
-    if (esk->bound && !IN_MULTICAST(esk->bind.ip.addr.local))
+    if (esk->bound && !IN_MULTICAST(ntohl(esk->bind.ip.addr.local)))
         if (esk->bind.ip.addr.local != denom)
             return htonl(INADDR_ANY);
 
@@ -1102,6 +1103,12 @@ exa_socket_tcp_accept(struct exa_endpoint * restrict endpoint,
 {
     int fd;
     struct exa_socket * restrict sock;
+#ifdef TCP_LISTEN_SOCKET_PROFILING
+    struct timespec begin_ts;
+    struct timespec end_ts;
+    struct timespec accept_duration;
+    clock_gettime(CLOCK_REALTIME, &begin_ts);
+#endif /* ifdef TCP_LISTEN_SOCKET_PROFILING */
 
     /* Create new bypass socket */
     exasock_override_off();
@@ -1145,6 +1152,13 @@ exa_socket_tcp_accept(struct exa_endpoint * restrict endpoint,
 
     exanic_tcp_accept(sock, endpoint);
 
+#ifdef TCP_LISTEN_SOCKET_PROFILING
+    clock_gettime(CLOCK_REALTIME, &end_ts);
+    ts_sub(&end_ts, &begin_ts, &accept_duration);
+    sock->state->p.tcp.profile.accept_period.tv_nsec = accept_duration.tv_nsec;
+    sock->state->p.tcp.profile.accept_period.tv_sec  = accept_duration.tv_sec;
+#endif /* ifdef TCP_LISTEN_SOCKET_PROFILING */
+
     /* The kernel writes to the rx buffer, so we need to poll for updates */
     sock->need_rx_ready_poll = true;
 
@@ -1165,6 +1179,7 @@ err_update_interfaces:
     exa_unlock(&sock->state->rx_lock);
     exa_unlock(&sock->state->tx_lock);
 err_socket_enable_bypass:
+    exa_write_unlock(&sock->lock);
 err_socket_get:
     exasock_override_off();
     close(fd);

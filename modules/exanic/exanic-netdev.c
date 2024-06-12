@@ -215,8 +215,14 @@ EXPORT_SYMBOL(exanic_netdev_ate_read_seq);
 int exanic_netdev_ate_send_ctrl(struct net_device *ndev, int ate_id)
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    int err;
+    unsigned long flags;
 
-    return exanic_transmit_payload(&priv->tx, ate_id, "\0", 0);
+    spin_lock_irqsave(&priv->tx_lock, flags);
+    err = exanic_transmit_payload(&priv->tx, ate_id, "\0", 0);
+    spin_unlock_irqrestore(&priv->tx_lock, flags);
+
+    return err;
 }
 EXPORT_SYMBOL(exanic_netdev_ate_send_ctrl);
 
@@ -696,6 +702,13 @@ static int exanic_netdev_kernel_start(struct net_device *ndev)
     int err;
     unsigned long flags;
 
+    if (tx_buf_size == 0)
+    {
+        netdev_err(ndev, "TX region usable size cannot be 0\n");
+        err = -ENOMEM;
+        goto err_buf_size;
+    }
+
     /* Allocate TX resources */
     err = exanic_alloc_tx_region(priv->ctx, priv->port, tx_buf_size,
                                  &tx_buf_offset);
@@ -768,6 +781,7 @@ static int exanic_netdev_kernel_start(struct net_device *ndev)
 err_alloc_tx_feedback:
     exanic_free_tx_region(priv->ctx, priv->port, PAGE_SIZE, tx_buf_offset);
 err_alloc_tx_region:
+err_buf_size:
     return err;
 }
 
@@ -859,9 +873,14 @@ static int exanic_netdev_open(struct net_device *ndev)
 
     if (!priv->bypass_only)
     {
-        /* Automatically load ExaNIC sockets support module */
+        /* Automatically load ExaNIC sockets support module. We must use _nowait
+         * here to avoid a deadlock: the exasock module depends on this module;
+         * if we arrive here while this module is in the process of being loaded
+         * or unloaded, the modprobe spawned by request_module might hang
+         * forever waiting for us to reach the ACTIVE state.
+         */
         if (!disable_exasock)
-            request_module("exasock");
+            request_module_nowait("exasock");
 
         /* Start sending and receiving packets in kernel */
         err = exanic_netdev_kernel_start(ndev);
@@ -875,6 +894,7 @@ static int exanic_netdev_open(struct net_device *ndev)
     return 0;
 
 err_kernel_start:
+    exanic_disable_port(priv->exanic, priv->port);
 err_enable_port:
     exanic_rx_put(priv->ctx, priv->port);
 err_alloc_rx_dma:
@@ -1044,7 +1064,11 @@ static int exanic_netdev_set_mac_addr(struct net_device *ndev, void *p)
     if (!err)
         err = exanic_get_mac_addr_regs(priv->exanic, priv->port, mac_addr);
     if (!err)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+        eth_hw_addr_set(ndev, mac_addr);
+#else
         memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+#endif
 
     mutex_unlock(mutex);
 
@@ -1071,104 +1095,141 @@ int exanic_set_features(struct net_device *netdev, netdev_features_t features)
 }
 #endif
 
-/**
- * Handle ioctl request on a ExaNIC interface.
- */
-int exanic_netdev_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
+int exanic_ioctl_set_hw_timestamp(struct net_device *ndev, struct ifreq *ifr,
+                                  int cmd)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct hwtstamp_config config;
+
+    if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+        return -EFAULT;
+
+    /* reserved for future extensions */
+    if (config.flags)
+        return -EINVAL;
+
+    if (config.tx_type != HWTSTAMP_TX_OFF &&
+            config.tx_type != HWTSTAMP_TX_ON)
+        return -ERANGE;
+
+    if (config.tx_type == HWTSTAMP_TX_OFF)
+    {
+        if (priv->tx_hw_tstamp)
+        {
+            priv->tx_hw_tstamp = false;
+            netdev_info(ndev, "hardware tx timestamping disabled\n");
+        }
+    }
+    else
+    {
+        if (!priv->tx_hw_tstamp)
+        {
+            priv->tx_hw_tstamp = true;
+            netdev_info(ndev, "hardware tx timestamping enabled\n");
+        }
+    }
+
+    if (config.rx_filter == HWTSTAMP_FILTER_NONE)
+    {
+        if (priv->rx_hw_tstamp)
+        {
+            priv->rx_hw_tstamp = false;
+            netdev_info(ndev, "hardware rx timestamping disabled\n");
+        }
+    }
+    else
+    {
+        config.rx_filter = HWTSTAMP_FILTER_ALL;
+
+        if (!priv->rx_hw_tstamp)
+        {
+            priv->rx_hw_tstamp = true;
+            netdev_info(ndev, "hardware rx timestamping enabled\n");
+        }
+    }
+
+    if (copy_to_user(ifr->ifr_data, &config, sizeof(config)))
+        return -EFAULT;
+
+    return 0;
+}
+
+int exanic_ioctl_get_hw_timestamp(struct net_device *ndev, struct ifreq *ifr,
+                                  int cmd)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct hwtstamp_config config;
+
+    memset(&config, 0, sizeof(config));
+
+    config.tx_type =
+        priv->tx_hw_tstamp ? HWTSTAMP_TX_ON : HWTSTAMP_TX_OFF;
+    config.rx_filter =
+        priv->rx_hw_tstamp ? HWTSTAMP_FILTER_ALL : HWTSTAMP_FILTER_NONE;
+
+    if (copy_to_user(ifr->ifr_data, &config, sizeof(config)))
+        return -EFAULT;
+
+    return 0;
+}
+
+int exanic_ioctl_get_ifinfo(struct net_device *ndev, struct ifreq *ifr,
+                            int cmd)
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
     struct exanic *exanic = priv->exanic;
 
+    /* Provide device name and port number to user */
+    struct exaioc_ifinfo info;
+    memset(&info, 0, sizeof(info));
+    strncpy(info.dev_name, exanic->name, sizeof(info.dev_name) - 1);
+    info.port_num = priv->port;
+    if (copy_to_user(ifr->ifr_data, &info, sizeof(info)))
+        return -EFAULT;
+    return 0;
+}
+
+
+/**
+ * Handle ioctl request on a ExaNIC interface.
+ */
+int exanic_netdev_ioctl(struct net_device *ndev, struct ifreq *ifr,
+                        int cmd)
+{
     switch (cmd)
     {
     case SIOCSHWTSTAMP:
         {
-            struct hwtstamp_config config;
-
-            if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
-                return -EFAULT;
-
-            /* reserved for future extensions */
-            if (config.flags)
-                return -EINVAL;
-
-            if (config.tx_type != HWTSTAMP_TX_OFF &&
-                    config.tx_type != HWTSTAMP_TX_ON)
-                return -ERANGE;
-
-            if (config.tx_type == HWTSTAMP_TX_OFF)
-            {
-                if (priv->tx_hw_tstamp)
-                {
-                    priv->tx_hw_tstamp = false;
-                    netdev_info(ndev, "hardware tx timestamping disabled\n");
-                }
-            }
-            else
-            {
-                if (!priv->tx_hw_tstamp)
-                {
-                    priv->tx_hw_tstamp = true;
-                    netdev_info(ndev, "hardware tx timestamping enabled\n");
-                }
-            }
-
-            if (config.rx_filter == HWTSTAMP_FILTER_NONE)
-            {
-                if (priv->rx_hw_tstamp)
-                {
-                    priv->rx_hw_tstamp = false;
-                    netdev_info(ndev, "hardware rx timestamping disabled\n");
-                }
-            }
-            else
-            {
-                config.rx_filter = HWTSTAMP_FILTER_ALL;
-
-                if (!priv->rx_hw_tstamp)
-                {
-                    priv->rx_hw_tstamp = true;
-                    netdev_info(ndev, "hardware rx timestamping enabled\n");
-                }
-            }
-
-            if (copy_to_user(ifr->ifr_data, &config, sizeof(config)))
-                return -EFAULT;
-
-            return 0;
+            return exanic_ioctl_set_hw_timestamp(ndev, ifr, cmd);
         }
     case SIOCGHWTSTAMP:
     case EXAIOCGHWTSTAMP:
         {
-            struct hwtstamp_config config;
-
-            memset(&config, 0, sizeof(config));
-
-            config.tx_type =
-                priv->tx_hw_tstamp ? HWTSTAMP_TX_ON : HWTSTAMP_TX_OFF;
-            config.rx_filter =
-                priv->rx_hw_tstamp ? HWTSTAMP_FILTER_ALL : HWTSTAMP_FILTER_NONE;
-
-            if (copy_to_user(ifr->ifr_data, &config, sizeof(config)))
-                return -EFAULT;
-
-            return 0;
+            return exanic_ioctl_get_hw_timestamp(ndev, ifr, cmd);
         }
+
+#if __HAS_KERNEL_NDO_ETH_IOCTL == 0
     case EXAIOCGIFINFO:
         {
-            /* Provide device name and port number to user */
-            struct exaioc_ifinfo info;
-            memset(&info, 0, sizeof(info));
-            strncpy(info.dev_name, exanic->name, sizeof(info.dev_name) - 1);
-            info.port_num = priv->port;
-            if (copy_to_user(ifr->ifr_data, &info, sizeof(info)))
-                return -EFAULT;
-            return 0;
+            return exanic_ioctl_get_ifinfo(ndev, ifr, cmd);
         }
+#endif
+
     default:
         return -EOPNOTSUPP;
     }
 }
+
+#if __HAS_KERNEL_NDO_ETH_IOCTL
+int exanic_netdev_siocdevprivate(struct net_device *ndev, struct ifreq *ifr,
+                              void __user *data, int cmd)
+{
+    if (cmd == EXAIOCGIFINFO)
+        return exanic_ioctl_get_ifinfo(ndev, ifr, cmd);
+    else
+        return -EOPNOTSUPP;
+}
+#endif /* __HAS_KERNEL_NDO_ETH_IOCTL*/
 
 static struct net_device_ops exanic_ndos = {
     .ndo_open                = exanic_netdev_open,
@@ -1176,7 +1237,16 @@ static struct net_device_ops exanic_ndos = {
     .ndo_start_xmit          = exanic_netdev_xmit,
     .ndo_set_rx_mode         = exanic_netdev_set_rx_mode,
     .ndo_set_mac_address     = exanic_netdev_set_mac_addr,
+#if __HAS_KERNEL_NDO_ETH_IOCTL
+    /* since linux 5.15.0 version and onwards ndo_eth_ioctl
+     * is called for ethernet specific ioctls such as SIOCSHWTSTAMP
+     * and SIOCGHWTSTAMP and ndo_siocdevprivate deals with SIOCDEVPRIVATE
+     * some linux distros backported those changes to linux 5.14 */
+    .ndo_eth_ioctl           = exanic_netdev_ioctl,
+    .ndo_siocdevprivate      = exanic_netdev_siocdevprivate,
+#else
     .ndo_do_ioctl            = exanic_netdev_ioctl,
+#endif
 
 #if __USE_RH_NETDEV_CHANGE_MTU
     .ndo_change_mtu_rh74     = exanic_netdev_change_mtu,
@@ -1252,6 +1322,15 @@ static int exanic_netdev_get_fecparam(struct net_device *ndev, struct ethtool_fe
 }
 
 #endif /* ETHTOOL_SFECPARAM */
+
+static int exanic_netdev_restart_autoneg(struct net_device* ndev)
+{
+    struct exanic_netdev_priv *priv = netdev_priv(ndev);
+    struct exanic *exanic = priv->exanic;
+    int port_no = priv->port;
+
+    return exanic_phyops_restart_autoneg(exanic, port_no);
+}
 
 static void exanic_netdev_get_drvinfo(struct net_device *ndev,
                                       struct ethtool_drvinfo *info)
@@ -1396,16 +1475,30 @@ out:
     return err;
 }
 
+#if __HAS_KERNEL_ETHTOOL_COALESCE
+static int exanic_netdev_get_coalesce(struct net_device *ndev,
+                                      struct ethtool_coalesce *ec,
+                                      struct kernel_ethtool_coalesce *kec,
+                                      struct netlink_ext_ack *nea)
+#else /* __HAS_KERNEL_ETHTOOL_COALESCE */
 static int exanic_netdev_get_coalesce(struct net_device *ndev,
                                       struct ethtool_coalesce *ec)
+#endif /* __HAS_KERNEL_ETHTOOL_COALESCE */
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
     ec->rx_coalesce_usecs = priv->rx_coalesce_timeout_ns / 1000;
     return 0;
 }
 
+#if __HAS_KERNEL_ETHTOOL_COALESCE
+static int exanic_netdev_set_coalesce(struct net_device *ndev,
+                                      struct ethtool_coalesce *ec,
+                                      struct kernel_ethtool_coalesce *kec,
+                                      struct netlink_ext_ack *nea)
+#else /* __HAS_KERNEL_ETHTOOL_COALESCE */
 static int exanic_netdev_set_coalesce(struct net_device *ndev,
                                       struct ethtool_coalesce *ec)
+#endif /* __HAS_KERNEL_ETHTOOL_COALESCE */
 {
     struct exanic_netdev_priv *priv = netdev_priv(ndev);
 
@@ -1591,7 +1684,8 @@ static struct ethtool_ops exanic_ethtool_ops = {
 #endif
     .get_eeprom_len         = exanic_netdev_get_eeprom_len,
     .get_eeprom             = exanic_netdev_get_eeprom,
-    .set_eeprom             = exanic_netdev_set_eeprom
+    .set_eeprom             = exanic_netdev_set_eeprom,
+    .nway_reset             = exanic_netdev_restart_autoneg
 };
 
 #if __RH_ETHTOOL_OPS_EXT
@@ -1843,14 +1937,24 @@ int exanic_netdev_alloc(struct exanic *exanic, unsigned port,
     spin_lock_init(&priv->tx_lock);
 
     SET_NETDEV_DEV(ndev, exanic_dev(exanic));
+    /* The weight parameter has been removed from netif_napi_add API
+     * If need to use weight use netif_napi_add_weight */
+#if __HAS_NAPI_WEIGHT_PARAM
     netif_napi_add(ndev, &priv->napi, exanic_netdev_poll, 64);
+#else
+    netif_napi_add(ndev, &priv->napi, exanic_netdev_poll);
+#endif
     ndev->ethtool_ops = &exanic_ethtool_ops;
     SET_ETHTOOL_OPS_EXT(ndev, &exanic_ethtool_ops_ext);
     ndev->netdev_ops = &exanic_ndos;
 
     err = exanic_get_mac_addr_regs(exanic, port, mac_addr);
     if (!err)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+        eth_hw_addr_set(ndev, mac_addr);
+#else
         memcpy(ndev->dev_addr, mac_addr, ETH_ALEN);
+#endif
 
     memcpy(ndev->perm_addr, exanic->port[port].orig_mac_addr, ETH_ALEN);
 

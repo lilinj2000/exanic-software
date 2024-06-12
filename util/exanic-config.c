@@ -181,6 +181,20 @@ void release_handle(exanic_t *exanic)
         exanic_release_handle(exanic);
 }
 
+void get_interface_name(const char *device, int port_number,
+                        char *buf, size_t len)
+{
+    exanic_t *exanic = acquire_handle(device);
+    if (exanic_get_interface_name(exanic, port_number, buf, len) != 0)
+    {
+        fprintf(stderr, "%s:%d: %s\n", device, port_number,
+                exanic_get_last_error());
+        release_handle(exanic);
+        exit(1);
+    }
+    release_handle(exanic);
+}
+
 int ethtool_ioctl(int fd, char *ifname, void *data)
 {
     struct ifreq ifr;
@@ -224,68 +238,79 @@ int ethtool_set_speed(int fd, char *ifname, uint32_t speed)
     return ethtool_ioctl(fd, ifname, &cmd);
 }
 
+static int ethtool_enable_autoneg(int fd, char* ifname, bool enable, uint32_t speed_mbs)
+{
+
+    struct ethtool_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmd = ETHTOOL_SSET;
+    cmd.autoneg = enable;
+    cmd.speed = speed_mbs;
+
+    return ethtool_ioctl(fd, ifname, &cmd);
+}
+
+static int restart_autoneg(const char* device, int port_number)
+{
+    int fd;
+    struct ethtool_cmd cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    char ifname[IFNAMSIZ];
+    cmd.cmd = ETHTOOL_NWAY_RST;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1)
+    {
+        fprintf(stderr, "%s:%d: %s\n", device, port_number, strerror(errno));
+        exit(1);
+    }
+
+    get_interface_name(device, port_number, ifname, IFNAMSIZ);
+    return ethtool_ioctl(fd, ifname, &cmd);
+}
+
 static int set_fec_via_register_access(const char* device, int port_number, uint32_t fec)
 {
-    exanic_t* exanic = acquire_handle(device);
-    if (exanic == NULL)
-        return -1;
-
-    uint32_t caps = exanic_register_read(exanic, REG_EXANIC_INDEX(REG_EXANIC_CAPS));
-    uint32_t port_flags = exanic_register_read(exanic, REG_PORT_INDEX(port_number, REG_PORT_FLAGS));
-    uint32_t autoneg_caps = exanic_register_read(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_ABILITY));
-    uint32_t old_autoneg_caps = autoneg_caps;
-    bool autoneg_enabled = !!(port_flags & EXANIC_PORT_FLAG_AUTONEG_ENABLE);
-
-    /* clear bits related to fec capability and enforcement fec mode */
-    old_autoneg_caps = autoneg_caps;
-    autoneg_caps &= ~(EXANIC_AUTONEG_FEC_CAPABILITY_MASK);
-    port_flags &= ~(EXANIC_PORT_FLAG_FORCE_FEC_MASK);
+    exanic_t *exanic = acquire_handle(device);
+    uint32_t caps = exanic_get_caps(exanic);
+    uint32_t port_flags;
 
     if (!IS_25G_SUPPORTED(caps))
     {
         /* there is no support for FEC in cards other than 25G */
         errno = EOPNOTSUPP;
+        release_handle(exanic);
         return -1;
     }
 
-    if ((fec & ETHTOOL_FEC_AUTO) && autoneg_enabled)
+    port_flags = exanic_register_read(exanic, REG_PORT_INDEX(port_number, REG_PORT_FLAGS));
+    if (port_flags & EXANIC_PORT_FLAG_AUTONEG_ENABLE)
     {
-        /* if FEC should be auto-selected, then enable all supported FEC modes bits in capabilities */
-        uint32_t fec_cap = EXANIC_SUPPORTED_FECS(caps);
-        autoneg_caps |= fec_cap;
-    }
-    else if ((fec & ETHTOOL_FEC_AUTO) && !autoneg_enabled)
-    {
-        fprintf(stderr, "Auto FEC is not supported when autoneg is turned off\n");
-        return -1;
-    }
-    else if (fec & ETHTOOL_FEC_BASER)
-    {
-        /* adding capability to the autoneg capability field, if autoneg is enabled */
-        if (autoneg_enabled)
-            autoneg_caps |= FEC_CAPABILITY_BASER;
-        else
-            port_flags |= EXANIC_PORT_FLAG_FORCE_BASER_FEC;
-    }
-    else if (fec & ETHTOOL_FEC_RS)
-    {
-        if (autoneg_enabled)
-            /* autoneg is enabled then set RSFEC in capabilities */
+        uint32_t autoneg_caps = exanic_register_read(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_ABILITY));
+        autoneg_caps &= ~(EXANIC_AUTONEG_FEC_CAPABILITY_MASK);
+
+        if (fec & ETHTOOL_FEC_RS)
             autoneg_caps |= FEC_CAPABILITY_RS_FEC;
-        else
-            /* forcing fec to RS_FEC when auto-neg is not enabled */
-            port_flags |= EXANIC_PORT_FLAG_FORCE_RS_FEC;
-    }
+        else if (fec & ETHTOOL_FEC_BASER)
+            autoneg_caps |= FEC_CAPABILITY_BASER;
 
-    exanic_register_write(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_ABILITY), autoneg_caps);
-    exanic_register_write(exanic, REG_PORT_INDEX(port_number, REG_PORT_FLAGS), port_flags);
+        exanic_register_write(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_ABILITY), autoneg_caps);
 
-    if (autoneg_enabled && (old_autoneg_caps != autoneg_caps))
-    {
-        /* restart autoneg if a new configuration applied  */
+        /* restart autoneg */
         exanic_register_write(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_CONTROL), EXANIC_PORT_AUTONEG_RESTART);
         exanic_register_write(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_CONTROL), 0);
     }
+    else
+    {
+        port_flags &= ~(EXANIC_PORT_FLAG_FORCE_FEC_MASK);
+        if (fec & ETHTOOL_FEC_RS)
+            port_flags |= EXANIC_PORT_FLAG_FORCE_RS_FEC;
+        else if (fec & ETHTOOL_FEC_BASER)
+            port_flags |= EXANIC_PORT_FLAG_FORCE_BASER_FEC;
+
+        exanic_register_write(exanic, REG_PORT_INDEX(port_number, REG_PORT_FLAGS), port_flags);
+    }
+    release_handle(exanic);
     return 0;
 }
 
@@ -527,7 +552,7 @@ static void show_port_autoneg_status(const char* device, int port_number, int ve
     uint32_t autoneg_status, autoneg_lp_ability;
     uint32_t autoneg_lp_tech_ability;
 
-    exanic_t* exanic= acquire_handle(device);
+    exanic_t *exanic = acquire_handle(device);
 
     static const char* tech_ability_bit_to_ethtool_mode [] =
     {
@@ -576,12 +601,12 @@ static void show_port_autoneg_status(const char* device, int port_number, int ve
     if (!IS_25G_SUPPORTED(caps))
     {
         fprintf(stderr, "This feature is not supported by non-25G compatible ExaNICs\n");
-        return;
+        goto exit;
     }
 
     printf("Autoneg enable: %s\n", autoneg_enabled ? "on" : "off");
     if (!autoneg_enabled)
-        return;
+        goto exit;
 
     /* print arbiter state */
     if (verbose)
@@ -591,7 +616,7 @@ static void show_port_autoneg_status(const char* device, int port_number, int ve
     }
 
     printf("Advertising modes:\n");
-    autoneg_caps = AUTONEG_CAPS(exanic_register_read(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_ABILITY)));
+    autoneg_caps = exanic_register_read(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_ABILITY));
 
     for (int i = 0; i < AUTONEG_TECH_ABILITY_END_BIT; i++)
     {
@@ -601,29 +626,19 @@ static void show_port_autoneg_status(const char* device, int port_number, int ve
     }
 
     printf("Supported FEC:\n");
-    printf("\tOff\n");
+    if (autoneg_caps & FEC_CAPABILITY_BASER)
+        printf("\tBaseR\n");
     if (autoneg_caps & FEC_CAPABILITY_RS_FEC)
         printf("\tRS\n");
-    if (autoneg_caps & FEC_CAPABILITY_BASER)
-        printf("\tBase-R\n");
+    printf("\tOff\n");
 
     autoneg_status = exanic_register_read(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_STATUS));
     autoneg_lp_ability = exanic_register_read(exanic, REG_EXTENDED_PORT_INDEX(port_number, REG_EXTENDED_PORT_AN_LP_ABILITY));
 
     if (!(autoneg_status & EXANIC_PORT_AUTONEG_FLAGS_LINK_PARTNER_IS_AUTONEG))
-        return;
+        goto exit;
 
-    printf("Resolved HCD: %s\n", hcd_string_value[AUTONEG_HCD_VALUE(autoneg_status)]);
-
-    if (autoneg_status & EXANIC_PORT_AUTONEG_FLAGS_RESOLVED_BASER_FEC)
-        printf("Resolved FEC: BaseR\n");
-    else if (autoneg_status & EXANIC_PORT_AUTONEG_FLAGS_RESOLVED_RS_FEC)
-        printf("Resolved FEC: RS\n");
-    else
-        printf("Resolved FEC: None\n");
-
-
-    printf("LP advertising:\n");
+    printf("Partner advertised modes:\n");
     autoneg_lp_tech_ability = LINK_PARTNER_TECHS(autoneg_lp_ability);
     for (int i = 0; i < AUTONEG_TECH_ABILITY_END_BIT; i++)
     {
@@ -632,35 +647,105 @@ static void show_port_autoneg_status(const char* device, int port_number, int ve
             printf("\t%s\n", s);
     }
 
-    printf("LP FEC capability:\n");
-    printf("\tOff\n");
-    if (autoneg_lp_ability & FEC_CAPABILITY_RS_FEC)
-        printf("\tRS\n");
+    printf("Partner FEC requested: ");
     if (autoneg_lp_ability & FEC_CAPABILITY_BASER)
-        printf("\tBase-R\n");
+        printf("BaseR\n");
+    else if (autoneg_lp_ability & FEC_CAPABILITY_RS_FEC)
+        printf("RS\n");
+    else
+        printf("Off\n");
+
+    printf("Resolved link mode: %s\n", hcd_string_value[AUTONEG_HCD_VALUE(autoneg_status)]);
+
+    if (autoneg_status & EXANIC_PORT_AUTONEG_FLAGS_RESOLVED_BASER_FEC)
+        printf("Resolved FEC: BaseR\n");
+    else if (autoneg_status & EXANIC_PORT_AUTONEG_FLAGS_RESOLVED_RS_FEC)
+        printf("Resolved FEC: RS\n");
+    else
+        printf("Resolved FEC: None\n");
+
+exit:
+    release_handle(exanic);
 }
 
 
-static void autoneg_command(const char* progname, const char* device, int port_number, int argc, char* argv[])
+static void enable_autoneg(const char* device, int port_number, bool enable, uint32_t speed_mbs)
 {
+    char ifname[IFNAMSIZ];
+    int fd;
+    get_interface_name(device, port_number, ifname, IFNAMSIZ);
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1)
+    {
+        fprintf(stderr, "%s:%d: %s\n", device, port_number, strerror(errno));
+        exit(1);
+    }
+
+    if (ethtool_enable_autoneg(fd, ifname, enable, speed_mbs) == -1)
+    {
+        fprintf(stderr, "%s:%d: %s\n", device, port_number, strerror(errno));
+        close(fd);
+        exit(1);
+    }
+    close(fd);
+}
+
+static int autoneg_command(const char* progname, const char* device, int port_number, int argc, char* argv[])
+{
+    exanic_t *exanic = acquire_handle(device);
+    uint32_t speed;
+    int usage_error = 0;
+
     if (argc > 0 && strcmp(argv[0], "status") == 0)
     {
         if (argc == 1)
         {
-            /* if command is "autoneg status" */
+            /* If command is "autoneg status" */
             show_port_autoneg_status(device, port_number, false);
-            return;
+            goto exit;
         }
         else if (argc == 2 && strcmp(argv[1], "-v") == 0)
         {
-            /* if command is "autoneg status -v" */
+            /* If command is "autoneg status -v" */
             show_port_autoneg_status(device, port_number, true);
-            return;
+            goto exit;
         }
     }
-    fprintf(stderr, "exanic-config version %s\n", EXANIC_VERSION_TEXT);
-    fprintf(stderr, "Autoneg status:\n");
-    fprintf(stderr, "   %s <device> autoneg status {-v}\n", progname);
+    else if (argc > 0 && (strcmp(argv[0], "on") == 0))
+    {
+        /* If command is "autoneg on" */
+        /* Do not enable autoneg if it is enabled already */
+        if (exanic_port_autoneg_enabled(exanic, port_number))
+        {
+            printf("%s: autonegotiation already on\n", device);
+            goto exit;
+        }
+
+        /* Enable autoneg with current speed advertisement only */
+        speed = exanic_get_port_speed(exanic, port_number);
+        enable_autoneg(device, port_number, true, speed);
+        printf("%s: autonegotiation on, advertising %d speed only\n", device, speed);
+        goto exit;
+    }
+    else if (argc > 0 && (strcmp(argv[0], "off") == 0))
+    {
+        /* If command is "autoneg off" */
+        speed = exanic_get_port_speed(exanic, port_number);
+        enable_autoneg(device, port_number, false, speed);
+        printf("%s: autonegotiation off, speed set to %d\n", device, speed);
+        goto exit;
+    }
+    else if (argc > 0 && (strcmp(argv[0], "restart") == 0))
+    {
+        /* If command is "autoneg restart" */
+        restart_autoneg(device, port_number);
+        goto exit;
+    }
+
+    usage_error = 1;
+exit:
+    release_handle(exanic);
+    return usage_error;
 }
 
 void show_device_info(const char *device, int port_number, int verbose)
@@ -672,6 +757,7 @@ void show_device_info(const char *device, int port_number, int verbose)
     exanic_function_id_t function;
     struct exanic_hw_info *hwinfo;
     time_t rev_date;
+    uint32_t caps;
     int fd;
 
     fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -681,6 +767,7 @@ void show_device_info(const char *device, int port_number, int verbose)
     hw_type = exanic_get_hw_type(exanic);
     function = exanic_get_function_id(exanic);
     rev_date = exanic_get_hw_rev_date(exanic);
+    caps = exanic_get_caps(exanic);
 
     printf("Device %s:\n", device);
 
@@ -831,12 +918,12 @@ void show_device_info(const char *device, int port_number, int verbose)
          * Check if firmware has bridging support
          * Always available on older cards regardless of capability bit
          */
-        uint32_t caps = exanic_get_caps(exanic);
         if ((caps & EXANIC_CAP_BRIDGING) ||
             hw_type == EXANIC_HW_X4 || hw_type == EXANIC_HW_X2)
         {
-            uint32_t pl_cfg = exanic_get_bridging_config(exanic);
-            printf("  Bridging: %s\n", (pl_cfg & EXANIC_FEATURE_BRIDGE) ?
+            uint32_t reg = exanic_register_read(exanic,
+                    REG_EXANIC_INDEX(REG_EXANIC_FEATURE_CFG));
+            printf("  Bridging: %s\n", (reg & EXANIC_FEATURE_BRIDGE) ?
                     "on (ports 0 and 1)" : "off");
         }
     }
@@ -918,34 +1005,53 @@ void show_device_info(const char *device, int port_number, int verbose)
         }
 
         if (function == EXANIC_FUNCTION_NIC &&
-            exanic_port_mirror_supported(exanic, i) &&
             (rx_usable || tx_usable))
         {
-            uint32_t pl_cfg;
-            uint32_t rx_bit = 0, tx_bit = 0;
+            int mirror_supported = 0, rx_mirror = 0, tx_mirror = 0;
+            uint32_t reg;
 
-            pl_cfg = exanic_get_bridging_config(exanic);
-
-            switch (i)
+            /* Legacy mirroring configuration bits */
+            if (hw_type == EXANIC_HW_X4 || (caps & EXANIC_CAP_MIRRORING))
             {
-                case 0:
-                    rx_bit = EXANIC_FEATURE_MIRROR_RX_0;
-                    tx_bit = EXANIC_FEATURE_MIRROR_TX_0;
-                    break;
-                case 1:
-                    rx_bit = EXANIC_FEATURE_MIRROR_RX_1;
-                    tx_bit = EXANIC_FEATURE_MIRROR_TX_1;
-                    break;
-                case 2:
-                    rx_bit = EXANIC_FEATURE_MIRROR_RX_2;
-                    tx_bit = EXANIC_FEATURE_MIRROR_TX_2;
-                    break;
+                reg = exanic_register_read(exanic,
+                        REG_EXANIC_INDEX(REG_EXANIC_FEATURE_CFG));
+                switch (i)
+                {
+                    case 0:
+                        rx_mirror = (reg & EXANIC_FEATURE_MIRROR_RX_0) != 0;
+                        tx_mirror = (reg & EXANIC_FEATURE_MIRROR_TX_0) != 0;
+                        break;
+                    case 1:
+                        rx_mirror = (reg & EXANIC_FEATURE_MIRROR_RX_1) != 0;
+                        tx_mirror = (reg & EXANIC_FEATURE_MIRROR_TX_1) != 0;
+                        break;
+                    case 2:
+                        rx_mirror = (reg & EXANIC_FEATURE_MIRROR_RX_2) != 0;
+                        tx_mirror = (reg & EXANIC_FEATURE_MIRROR_TX_2) != 0;
+                        break;
+                }
+
+                if (exanic->num_ports > 0 && i < exanic->num_ports - 1)
+                    mirror_supported = 1;
             }
 
-            printf("    Mirroring: %s\n",
-                    (pl_cfg & rx_bit) && (pl_cfg & tx_bit) ? "RX and TX" :
-                    (pl_cfg & rx_bit) ? "RX only" :
-                    (pl_cfg & tx_bit) ? "TX only" : "off");
+            /* Extended mirroring configuration bits */
+            if (caps & EXANIC_CAP_EXT_MIRRORING)
+            {
+                reg = exanic_register_read(exanic,
+                        REG_EXANIC_INDEX(REG_EXANIC_MIRROR_ENABLE_EXT));
+                rx_mirror = (reg & (1 << (2 * i))) != 0;
+                tx_mirror = (reg & (2 << (2 * i))) != 0;
+                mirror_supported = 1;
+            }
+
+            if (mirror_supported)
+            {
+                printf("    Mirroring: %s\n",
+                        rx_mirror && tx_mirror ? "RX and TX" :
+                        rx_mirror ? "RX only" :
+                        tx_mirror ? "TX only" : "off");
+            }
         }
 
         if ((function == EXANIC_FUNCTION_NIC ||
@@ -1192,20 +1298,6 @@ int show_sfp_status(const char *device, int port_number)
     return 0;
 }
 
-void get_interface_name(const char *device, int port_number,
-                        char *buf, size_t len)
-{
-    exanic_t *exanic = acquire_handle(device);
-    if (exanic_get_interface_name(exanic, port_number, buf, len) != 0)
-    {
-        fprintf(stderr, "%s:%d: %s\n", device, port_number,
-                exanic_get_last_error());
-        release_handle(exanic);
-        exit(1);
-    }
-    release_handle(exanic);
-}
-
 void set_port_enable_state(const char *device, int port_number, int mode)
 {
     struct ifreq ifr;
@@ -1356,8 +1448,8 @@ static void set_fec(const char* device, int port_number, const char* fec)
         [ETHTOOL_FEC_NONE_BIT]  = "",
         [ETHTOOL_FEC_AUTO_BIT]  = "auto",
         [ETHTOOL_FEC_OFF_BIT]   = "off",
-        [ETHTOOL_FEC_RS_BIT]    = "RS",
-        [ETHTOOL_FEC_BASER_BIT] = "BaseR",
+        [ETHTOOL_FEC_RS_BIT]    = "rs",
+        [ETHTOOL_FEC_BASER_BIT] = "baser",
         NULL
     };
 
@@ -1373,7 +1465,7 @@ static void set_fec(const char* device, int port_number, const char* fec)
 
     while(*ptr != NULL)
     {
-        if(!strcmp(*ptr, fec))
+        if(!strcasecmp(*ptr, fec))
             break;
         ptr++;
     }
@@ -1603,7 +1695,7 @@ int set_disable_tx_padding(const char *device, int port_number, int enable)
         fprintf(stderr, "%s:%d: failed to update TX frame padding:"
                 " not supported by firmware\n", device, port_number);
 
-        exanic_release_handle(exanic);
+        release_handle(exanic);
         return 1;
     }
 
@@ -1646,11 +1738,11 @@ int set_disable_tx_crc(const char *device, int port_number, int enable)
 
     printf("%s:%d: TX CRCs %s\n", device, port_number,
            enable ? "disabled" : "enabled");
-    exanic_release_handle(exanic);
+    release_handle(exanic);
     return 0;
 
 err_handle_release:
-    exanic_release_handle(exanic);
+    release_handle(exanic);
     return 1;
 }
 
@@ -2796,15 +2888,24 @@ int handle_options_on_nic(char* device, int port_number, int argc, char** argv)
     else if (argc == 4 && strcmp(argv[2], "speed") == 0 &&
             port_number != -1)
     {
-        int speed = parse_number(argv[3]);
-        if (speed == -1)
-            return 1;
-
+        int speed;
+        if (strcmp(argv[3], "auto") == 0)
+        {
+            /* enable autonegotiation and advertise all supported technologies */
+            enable_autoneg(device, port_number, true, 0);
+            return 0;
+        }
+        else
+        {
+            speed = parse_number(argv[3]);
+            if (speed == -1)
+                return 1;
+        }
         set_speed(device, port_number, speed);
         return 0;
     }
     else if (argc == 4 && strcmp(argv[2], "fec") == 0 &&
-            port_number != 1)
+            port_number != -1)
     {
         set_fec(device, port_number, argv[3]);
         return 0;
@@ -3026,9 +3127,11 @@ usage_error:
     fprintf(stderr, "   %s <interface> local-loopback { on | off }\n", argv[0]);
     fprintf(stderr, "   %s <interface> bypass-only { on | off }\n", argv[0]);
     fprintf(stderr, "   %s <interface> promisc { on | off }\n", argv[0]);
-    fprintf(stderr, "   %s <interface> speed <speed>\n", argv[0]);
+    fprintf(stderr, "   %s <interface> speed { 100 | 1000 | 10000 | ... | auto }\n", argv[0]);
+    fprintf(stderr, "   %s <interface> autoneg { on | off }\n", argv[0]);
     fprintf(stderr, "   %s <interface> autoneg status [-v]\n", argv[0]);
-    fprintf(stderr, "   %s <interface> fec { auto | off | RS | BaseR }\n", argv[0]);
+    fprintf(stderr, "   %s <interface> autoneg restart [-v]\n", argv[0]);
+    fprintf(stderr, "   %s <interface> fec { auto | off | rs | baser }\n", argv[0]);
     fprintf(stderr, "   %s <interface> disable-tx-padding { on | off }\n", argv[0]);
     fprintf(stderr, "   %s <interface> disable-tx-crc { on | off }\n", argv[0]);
     fprintf(stderr, "   %s <device> pps-out { on | off }\n", argv[0]);
@@ -3040,6 +3143,5 @@ usage_error:
     fprintf(stderr, "      Wildcards are accepted for devices and device:ports in the form '*',\n");
     fprintf(stderr, "      which matches anything, or '[X-Y]', which matches numbers X through Y\n");
     fprintf(stderr, "      inclusive, for example \"exanic*:[0-3]\".\n");
-    fprintf(stderr, "      <speed> is in Mbit/s (e.g. 100 | 1000 | 10000 | 40000)\n");
     return 2;
 }

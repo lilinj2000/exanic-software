@@ -1,7 +1,7 @@
 /*
  * flash_access_cfi.c: Functions to access CFI flash memory devices on ExaNIC cards
  *
- * Copyright (C) 2020 Exablaze Pty Ltd
+ * Copyright (c) 2020-2022 by Cisco Systems, Inc.
  */
 
 #include <stdint.h>
@@ -58,11 +58,14 @@
 static void cfi_flash_init_interface(struct flash_device *flash)
 {
     /* nWE high, nCE high, nOE high, nL high */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0xf);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nCE | EXANIC_FLASH_CTRL_nOE |
+        EXANIC_FLASH_CTRL_nADV);
     /* dummy read for timing */
     exanic_register_read(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL));
     /* nWE high, nCE low, nOE high, nL low */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x5);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nOE);
 }
 
 static void cfi_flash_set_address(struct flash_device *flash, flash_address_t address)
@@ -74,28 +77,34 @@ static flash_word_t cfi_flash_read_current(struct flash_device *flash)
 {
     flash_word_t data;
     /* nWE high, nCE low, nOE high, nL low, flash to FPGA */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x5);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nOE);
     /* drive OE low */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x1);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE);
     /* dummy read for timing */
     exanic_register_read(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_DIN_CFI));
     data = exanic_register_read(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_DIN_CFI));
     /* return OE high */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x5);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nOE);
     return data;
 }
 
 static void cfi_flash_write_current(struct flash_device *flash, flash_word_t data)
 {
     /* nWE high, nCE low, nOE high, nL low, FPGA to flash */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x15);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nOE | EXANIC_FLASH_CTRL_BUS_DIR);
     exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_DOUT_CFI), data);
     /* drive WE low */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x14);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nOE | EXANIC_FLASH_CTRL_BUS_DIR);
     /* dummy read for timing */
     exanic_register_read(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_DIN_CFI));
     /* return WE high */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0x15);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nOE | EXANIC_FLASH_CTRL_BUS_DIR);
 }
 
 static flash_word_t cfi_flash_read(struct flash_device *flash, flash_address_t address)
@@ -128,7 +137,9 @@ static bool cfi_flash_read_multiple(struct flash_device *flash, flash_address_t 
 static void cfi_flash_release_interface(struct flash_device *flash)
 {
     /* nWE high, nCE high, nOE high, nL high */
-    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL), 0xf);
+    exanic_register_write(flash->exanic, REG_HW_INDEX(REG_HW_FLASH_CTRL),
+        EXANIC_FLASH_CTRL_nWE | EXANIC_FLASH_CTRL_nCE | EXANIC_FLASH_CTRL_nOE |
+        EXANIC_FLASH_CTRL_nADV);
 }
 
 /**
@@ -226,10 +237,13 @@ static bool mt28_init(struct flash_device *flash)
     cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_2, MT28_UNLOCK_DATA_2);
     cfi_flash_write(flash, 0, MT28_READ_ARRAY);
 
-    /* enter unlock bypass mode */
-    cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_1, MT28_UNLOCK_DATA_1);
-    cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_2, MT28_UNLOCK_DATA_2);
-    cfi_flash_write(flash, MT28_UNLOCK_BYPASS_ADDRESS, MT28_UNLOCK_BYPASS_DATA);
+    if (flash->supports_unlock_bypass)
+    {
+        /* enter unlock bypass mode */
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_1, MT28_UNLOCK_DATA_1);
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_2, MT28_UNLOCK_DATA_2);
+        cfi_flash_write(flash, MT28_UNLOCK_BYPASS_ADDRESS, MT28_UNLOCK_BYPASS_DATA);
+    }
     return true;
 }
 
@@ -272,8 +286,21 @@ static bool mt28_check_status(struct flash_device *flash, flash_word_t error_mas
 
 static bool mt28_erase_block(struct flash_device *flash, flash_address_t address)
 {
-    cfi_flash_set_address(flash, address);
-    cfi_flash_write_current(flash, MT28_BLOCK_ERASE_SETUP);
+    if (flash->supports_unlock_bypass)
+    {
+        cfi_flash_set_address(flash, address);
+        cfi_flash_write_current(flash, MT28_BLOCK_ERASE_SETUP);
+    }
+    else
+    {
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_1, MT28_UNLOCK_DATA_1);
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_2, MT28_UNLOCK_DATA_2);
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_1, MT28_BLOCK_ERASE_SETUP);
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_1, MT28_UNLOCK_DATA_1);
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_2, MT28_UNLOCK_DATA_2);
+        cfi_flash_set_address(flash, address);
+    }
+
     cfi_flash_write_current(flash, MT28_BLOCK_ERASE_CONFIRM);
     if (!mt28_check_status(flash, MT28_STATUS_ERASE_ERROR_MASK))
     {
@@ -288,6 +315,12 @@ static bool mt28_burst_program(struct flash_device *flash, flash_address_t addre
         flash_word_t *data, flash_size_t size)
 {
     flash_size_t offset;
+
+    if (!flash->supports_unlock_bypass)
+    {
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_1, MT28_UNLOCK_DATA_1);
+        cfi_flash_write(flash, MT28_UNLOCK_ADDRESS_2, MT28_UNLOCK_DATA_2);
+    }
 
     cfi_flash_set_address(flash, address);
     cfi_flash_write_current(flash, MT28_BUFFER_PROGRAM_SETUP);
@@ -322,10 +355,12 @@ struct flash_device *flash_open_cfi(exanic_t *exanic, bool recovery_partition,
         flash_size_t *partition_size)
 {
     struct flash_device *flash;
-    uint16_t command_set, burst_buffer_size, block_size_b, num_blocks_b, block_size_t;
-    uint8_t device_size;
+    uint16_t command_set, burst_buffer_size_bits;
+    uint8_t device_size_bits;
+    flash_size_t block_size_1, block_size_2, block_size_3, device_size,
+                 num_blocks_1, num_blocks_2, num_blocks_3, device_end;
 
-    flash = calloc(1, sizeof(struct flash_device));
+    flash = (struct flash_device *) calloc(1, sizeof(struct flash_device));
     if (!flash)
     {
         fprintf(stderr, "ERROR: memory allocation failed\n");
@@ -364,37 +399,52 @@ struct flash_device *flash_open_cfi(exanic_t *exanic, bool recovery_partition,
             goto error;
     }
 
-    device_size = cfi_flash_read(flash, 0x27);
-    if (device_size < 24)
+    device_size_bits = cfi_flash_read(flash, 0x27);
+    if (device_size_bits < 24)
     {
-        fprintf(stderr, "ERROR: unexpected flash device size (bits=%u)\n", device_size);
+        fprintf(stderr, "ERROR: unexpected flash device size (bits=%u)\n", device_size_bits);
         goto error;
     }
 
-    flash->partition_size = *partition_size = 1 << (device_size-2);
+    flash->device_size = device_size = 1 << (device_size_bits-1);
+    flash->partition_size = *partition_size = device_size / 2;
     flash->partition_start = recovery_partition ? 0 : flash->partition_size;
     flash->is_recovery = recovery_partition;
 
-    burst_buffer_size = (cfi_flash_read(flash, 0x2b) << 8) | (cfi_flash_read(flash, 0x2a));
-    if ((burst_buffer_size < 2) || (burst_buffer_size > device_size))
+    burst_buffer_size_bits = (cfi_flash_read(flash, 0x2b) << 8) | (cfi_flash_read(flash, 0x2a));
+    if ((burst_buffer_size_bits < 2) || (burst_buffer_size_bits > device_size_bits))
     {
-        fprintf(stderr, "ERROR: unexpected burst buffer size (bits=%u)\n", burst_buffer_size);
+        fprintf(stderr, "ERROR: unexpected burst buffer size (bits=%u)\n", burst_buffer_size_bits);
         goto error;
     }
-    flash->burst_buffer_size = 1 << (burst_buffer_size-1);
+    flash->burst_buffer_size = 1 << (burst_buffer_size_bits-1);
 
-    block_size_b = ((cfi_flash_read(flash, 0x30) << 8) | (cfi_flash_read(flash, 0x2f)));
-    num_blocks_b = ((cfi_flash_read(flash, 0x2e) << 8) | (cfi_flash_read(flash, 0x2d))) + 1;
-    block_size_t = ((cfi_flash_read(flash, 0x34) << 8) | (cfi_flash_read(flash, 0x33)));
-    if ((block_size_b < block_size_t) || (block_size_b < 1))
+    block_size_1 = ((cfi_flash_read(flash, 0x30) << 8) | (cfi_flash_read(flash, 0x2f))) * 256 / 2;
+    num_blocks_1 = ((cfi_flash_read(flash, 0x2e) << 8) | (cfi_flash_read(flash, 0x2d))) + 1;
+    block_size_2 = ((cfi_flash_read(flash, 0x34) << 8) | (cfi_flash_read(flash, 0x33))) * 256 / 2;
+    num_blocks_2 = ((cfi_flash_read(flash, 0x32) << 8) | (cfi_flash_read(flash, 0x31))) + 1;
+    block_size_3 = ((cfi_flash_read(flash, 0x38) << 8) | (cfi_flash_read(flash, 0x37))) * 256 / 2;
+    num_blocks_3 = ((cfi_flash_read(flash, 0x36) << 8) | (cfi_flash_read(flash, 0x35))) + 1;
+
+    flash->region_1_block_size = block_size_1;
+    flash->region_2_start = num_blocks_1 * block_size_1;
+    flash->region_2_block_size = block_size_2;
+    flash->region_3_start = flash->region_2_start + num_blocks_2 * block_size_2;
+    flash->region_3_block_size = block_size_3;
+    device_end = flash->region_3_start + num_blocks_3 * block_size_3;
+    if (device_end != device_size)
     {
-        fprintf(stderr, "ERROR: flash organization not currently supported\n");
+        fprintf(stderr, "ERROR: unexpected flash layout (%ux%u + %ux%u + %ux%u != %u)\n",
+                        num_blocks_1, block_size_1, num_blocks_2, block_size_2,
+                        num_blocks_3, block_size_3, device_size);
         goto error;
     }
-    flash->block_size = block_size_b * 256 / 2;
+
+    flash->main_block_size = (block_size_2 > block_size_1) ? block_size_2 : block_size_1;
     flash->min_read_size = 1;
-    flash->boot_area_start = num_blocks_b * flash->block_size;
-    flash->boot_area_block_size = block_size_t * 256 / 2;
+    /* FPGA bitstreams should be bit-reversed when writing to parallel flash */
+    flash->bit_reverse_bitstream = true;
+    flash->supports_unlock_bypass = (cfi_flash_read(flash, 0x51) != 0);
 
     return flash;
 

@@ -23,6 +23,10 @@ struct flash_device *flash_open(exanic_t *exanic, bool recovery_partition,
     struct flash_device *flash = info->type == EXANIC_FW_FLASH_QSPI ?
         flash_open_qspi(exanic, recovery_partition, partition_size) :
         flash_open_cfi(exanic, recovery_partition, partition_size);
+
+    if (!flash)
+        return NULL;
+
     if (flash->ops->init && !flash->ops->init(flash))
     {
         flash_close(flash);
@@ -36,16 +40,30 @@ bool flash_erase(struct flash_device *flash, flash_size_t size, void (*report_pr
     flash_address_t address = flash->partition_start;
     flash_address_t erase_end = address + size;
 
-    while (address < erase_end)
+    for (; address < erase_end && address < flash->region_2_start;
+           address += flash->region_1_block_size)
     {
         if (!flash->ops->erase_block(flash, address))
             return false;
         report_progress();
-
-        flash_size_t erase_size = (address >= flash->boot_area_start) ?
-            flash->boot_area_block_size : flash->block_size;
-        address += erase_size;
     }
+
+    for (; address < erase_end && address < flash->region_3_start;
+           address += flash->region_2_block_size)
+    {
+        if (!flash->ops->erase_block(flash, address))
+            return false;
+        report_progress();
+    }
+
+    for (; address < erase_end;
+           address += flash->region_3_block_size)
+    {
+        if (!flash->ops->erase_block(flash, address))
+            return false;
+        report_progress();
+    }
+
     return true;
 }
 
@@ -61,7 +79,7 @@ bool flash_program(struct flash_device *flash, flash_word_t *data, flash_size_t 
         burst_size = MIN(flash->burst_buffer_size, size-offset);
         if (!flash->ops->burst_program(flash, address, &data[offset], burst_size))
             return false;
-        if ((offset & (flash->block_size-1)) == 0)
+        if ((offset & (flash->main_block_size-1)) == 0)
             report_progress();
     }
     return true;
@@ -104,7 +122,7 @@ bool flash_verify(struct flash_device *flash, flash_word_t *data, flash_size_t s
         }
 
         words_unreported += to_read;
-        if (words_unreported >= flash->block_size)
+        if (words_unreported >= flash->main_block_size)
         {
             report_progress();
             words_unreported = 0;

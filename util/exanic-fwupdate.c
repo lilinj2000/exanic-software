@@ -15,6 +15,7 @@
 #include "fwupdate/flash_access.h"
 #include "fwupdate/file_access.h"
 #include "fwupdate/hot_reload.h"
+#include "fwupdate/bitstream_config.h"
 
 /*
  * Functions for progress reporting of each stage
@@ -79,7 +80,8 @@ static bool check_target_hardware(const char *firmware_id, exanic_t *exanic)
 
     if (!found_match)
     {
-        fprintf(stderr, "ERROR: card hardware unsupported by this software version\n");
+        fprintf(stderr, "ERROR: firmware ID %s is not supported by this software version\n",
+                        firmware_id);
         return false;
     }
 
@@ -187,13 +189,16 @@ int main(int argc, char *argv[])
         report_phase_done();
 
         report_phase("Loading and checking update");
-        data = read_firmware(filename, flash->partition_size,
+        data = read_firmware(filename, flash->partition_size, flash->bit_reverse_bitstream,
                              &data_size, &firmware_id);
         if (!data)
             goto error;
         report_phase_done();
 
         if (!check_target_hardware(firmware_id, exanic))
+            goto error;
+
+        if (!check_bitstream_config(flash, data, data_size))
             goto error;
 
         if (verify_only)

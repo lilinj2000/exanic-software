@@ -29,6 +29,7 @@
 #include "override.h"
 #include "trace.h"
 #include "common.h"
+#include "../latency.h"
 
 void __chk_fail(void);
 
@@ -83,6 +84,7 @@ pselect_spin(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
     memset(native_writefds, 0, set_bytes);
     memset(native_exceptfds, 0, set_bytes);
 
+    LATENCY_START_POINT(0);
     /* Look for sockets with bypass enabled */
     if (readfds != NULL)
     {
@@ -169,12 +171,14 @@ pselect_spin(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
     iters = DEFAULT_ITERS;
     signal_received = false;
 
+    LATENCY_END_POINT(0);
     have_poll_lock = exa_trylock(&exasock_poll_lock);
 
     /* Initial poll of ExaNICs, no spinning yet */
     if (have_poll_lock)
-        exanic_poll();
+        exanic_poll(NULL);
 
+    LATENCY_START_POINT(1);
     /* Initial check for sockets that are ready */
     ready_count = 0;
     for (fd = 0; fd < nfds; fd++)
@@ -207,6 +211,7 @@ pselect_spin(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 
         exa_read_unlock(&sock->lock);
     }
+    LATENCY_END_POINT(1);
 
     if (ready_count > 0)
     {
@@ -268,14 +273,63 @@ pselect_spin(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 
         if (have_poll_lock)
         {
+            fd_mask expected_readfds[set_words];
+            int e_nfds = 0;
+            int expected_fd;
+            memset(expected_readfds, 0, set_bytes);
+
             /* Poll ExaNICs for packets */
+
             for (i = 0; i < iters; i++)
             {
                 struct exa_socket * restrict sock;
+                expected_fd = -1;
 
-                fd = exanic_poll();
+                LATENCY_START_POINT(3);
+                fd = exanic_poll(&expected_fd);
                 if (fd < 0 || fd >= nfds)
+                {
+                    if (expected_fd >= 0 && expected_fd < nfds &&
+                        FD_ISSET(expected_fd, (fd_set *)bypass_readfds))
+                    {
+                        /* Add to expected_readfds, no need to check
+                         * with bypass, because expected_fd is set when there is some activity on
+                         * one of the exasock listenning sockets as of pending connection
+                         * and they may be ready anytime soon */
+                        FD_SET(expected_fd, (fd_set*)expected_readfds);
+                        e_nfds = expected_fd + 1;
+                    }
+
+                    if (e_nfds > 0)
+                    {
+                        int j;
+                        for (j = 0; j < e_nfds; j++)
+                        {
+                            if (!FD_ISSET(j, (fd_set *)expected_readfds))
+                                continue;
+
+                            struct exa_socket * restrict sock = exa_socket_get(j);
+                            if (sock == NULL)
+                                continue;
+
+                            exa_read_lock(&sock->lock);
+
+                            /* May be sock->state->rx_lock is needed? todo */
+                            if (sock->need_rx_ready_poll)
+                                exa_notify_tcp_read_update(sock);
+
+                            if (sock->rx_ready)
+                            {
+                                exa_read_unlock(&sock->lock);
+                                FD_SET(j, readfds);
+                                ret = 1;
+                                goto select_exit;
+                            }
+                            exa_read_unlock(&sock->lock);
+                        }
+                    }
                     continue;
+                }
                 sock = exa_socket_get(fd);
 
                 exa_read_lock(&sock->lock);
@@ -285,6 +339,7 @@ pselect_spin(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
                     exa_read_unlock(&sock->lock);
                     FD_SET(fd, readfds);
                     ret = 1;
+                    LATENCY_END_POINT(3);
                     goto select_exit;
                 }
 
@@ -438,6 +493,7 @@ ppoll_spin(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
     int ret = 0;
     bool have_poll_lock;
 
+    LATENCY_START_POINT(7);
     for (i = 0; i < nfds; i++)
     {
         struct pollfd * restrict pollfd = &fds[i];
@@ -466,6 +522,7 @@ ppoll_spin(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
         /* Native sockets only, call libc poll() or ppoll() directly */
         return NATIVE_FD_ONLY;
     }
+    LATENCY_END_POINT(7);
 
     if (timeout)
     {
@@ -481,8 +538,9 @@ ppoll_spin(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
 
     /* Initial poll of ExaNICs, no spinning yet */
     if (have_poll_lock)
-        exanic_poll();
+        exanic_poll(NULL);
 
+    LATENCY_START_POINT(8);
     /* Initial check for sockets that are ready */
     for (i = 0; i < nfds; i++)
     {
@@ -523,6 +581,7 @@ ppoll_spin(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
         pollfd->revents = revents;
         ready_count++;
     }
+    LATENCY_END_POINT(8);
 
     if (ready_count > 0)
     {
@@ -578,18 +637,30 @@ ppoll_spin(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
 
         if (have_poll_lock)
         {
+			struct fd_list* fdl_head = NULL;
+			int fdlist_size = 0;
+			int expected_fd = -1;
+
             /* Poll ExaNICs for packets */
             for (i = 0; i < iters; i++)
             {
                 int j;
+                expected_fd = -1;
+                LATENCY_START_POINT(9);
+                fd = exanic_poll(&expected_fd);
+                if (fd < 0 && expected_fd == -1 && fdlist_size == 0)
+                    continue;
 
-                fd = exanic_poll();
                 if (fd >= 0)
                 {
                     struct exa_socket * restrict sock = exa_socket_get(fd);
                     short revents = 0;
 
                     exa_read_lock(&sock->lock);
+
+                    /* May be sock->state->rx_lock is needed? todo */
+                    if (sock->need_rx_ready_poll)
+                        exa_notify_tcp_read_update(sock);
 
                     if (sock->rx_ready)
                         revents |= POLLIN | POLLRDNORM;
@@ -610,11 +681,61 @@ ppoll_spin(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
                                 continue;
                             fds[j].revents = revents;
                             ret = 1;
+                            LATENCY_END_POINT(9);
                             goto poll_exit;
                         }
                     }
                 }
+                if (expected_fd >= 0)
+                {
+                    for (j = 0; j < nfds; j++)
+                    {
+                        if (fds[j].fd == expected_fd && (fds[j].events & POLLIN))
+                        {
+                            int added = fdlist_insert(&fdl_head, expected_fd);
+                            if (added)
+                                fdlist_size++;
+                        }
+                    }
+                }
+
+                if (fdlist_size > 0)
+                {
+                    struct fd_list* current;
+                    for (current = fdl_head; current; current = current->next)
+                    {
+                        struct exa_socket * restrict sock = exa_socket_get(current->fd);
+                        short revents = 0;
+
+                        exa_read_lock(&sock->lock);
+
+                        /* May be sock->state->rx_lock is needed? todo */
+                        if (sock->need_rx_ready_poll)
+                            exa_notify_tcp_read_update(sock);
+
+                        if (sock->rx_ready)
+                            revents |= POLLIN | POLLRDNORM;
+
+                        exa_read_unlock(&sock->lock);
+                        /* FIXME: Need a table for looking up by fd */
+                        for (j = 0; j < nfds; j++)
+                        {
+                            if (fds[j].fd == current->fd)
+                            {
+                                revents &= fds[j].events;
+                                if (revents == 0)
+                                    continue;
+                                fds[j].revents = revents;
+                                ret = 1;
+                                goto poll_exit;
+                            }
+                        }
+                    }
+                }
             }
+
+            if (fdl_head)
+                fdlist_clear(fdl_head);
         }
 
         /* Poll sockets for readiness */

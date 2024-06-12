@@ -107,13 +107,14 @@ enum
      * (see \ref exanic_feature_cfg_t)
      * Availability: NIC only
      * Bitmap:
-     * [18]   - [RO] DDR4 fitted to this PCB (X25, X100 only)
-     * [17]   - [RO] HW startup in progress
-     * [16]   - [RW] Set to 0 to permanently clear the auxiliary enable signals
-     * [15]   - reserved
-     * [14:8] - [RO] Auxiliary bridging & mirroring configuration bits
-     * [7]    - reserved
-     * [6:0]  - Bridging & mirroring configuration bits
+     * [23:20] - [RO] Mirror output port (extended mirroring)
+     * [18]    - [RO] DDR4 fitted to this PCB (X25, X100 only)
+     * [17]    - [RO] HW startup in progress
+     * [16]    - [RW] Set to 0 to permanently clear the auxiliary enable signals
+     * [15]    - reserved
+     * [14:8]  - [RO] Auxiliary bridging & mirroring configuration bits (legacy)
+     * [7]     - reserved
+     * [6:0]   - Bridging & mirroring configuration bits (legacy)
      */
     REG_EXANIC_FEATURE_CFG              = 2,
 
@@ -219,6 +220,19 @@ enum
      * set, the corresponding port has ATE.
      */
     REG_EXANIC_PORTS_ATE_STATUS         = 19,
+
+    /**
+     * [RW] Extended mirroring enable bits
+     * Availablity: EXANIC_CAP_EXT_MIRRORING is set
+     * Bit 0  - Mirror port 0 RX
+     * Bit 1  - Mirror port 0 TX
+     * Bit 2  - Mirror port 1 RX
+     * Bit 3  - Mirror port 1 TX
+     * ...
+     * Bit 30 - Mirror port 15 RX
+     * Bit 31 - Mirror port 15 TX
+     */
+    REG_EXANIC_MIRROR_ENABLE_EXT        = 20,
 
     /**
      * [RW] Bi-color LED control
@@ -1175,6 +1189,7 @@ typedef enum
     EXANIC_HW_X25           = 9,  /**< ExaNIC X25 */
     EXANIC_HW_X100          = 10, /**< ExaNIC X100 */
     EXANIC_HW_V9P           = 11, /**< ExaNIC V9P */
+    EXANIC_HW_V9P_3         = 12, /**< ExaNIC V9P-3 */
 } exanic_hardware_id_t;
 
 /**
@@ -1210,6 +1225,8 @@ static inline const char * exanic_hardware_id_str(exanic_hardware_id_t id)
             return "ExaNIC X100";
         case EXANIC_HW_V9P:
             return "ExaNIC V9P";
+        case EXANIC_HW_V9P_3:
+            return "ExaNIC V9P-3";
         default:
             return NULL;
     }
@@ -1311,9 +1328,10 @@ typedef enum
     EXANIC_CAP_RX_IRQ           = EXANIC_CAP_RX_MSI,
 
     EXANIC_CAP_BRIDGING         = 0x00010000, /**< bridging supported */
-    EXANIC_CAP_MIRRORING        = 0x00020000, /**< mirroring supported */
+    EXANIC_CAP_MIRRORING        = 0x00020000, /**< mirroring supported (legacy mode) */
     EXANIC_CAP_DISABLE_TX_PADDING  = 0x00040000, /**< TX frame padding can be disabled */
     EXANIC_CAP_DISABLE_TX_CRC   = 0x00080000, /**< TX CRCs can be disabled */
+    EXANIC_CAP_EXT_MIRRORING    = 0x00100000, /**< mirroring supported (extended mode) */
 
     EXANIC_CAP_100M             = 0x01000000, /**< 100M supported */
     EXANIC_CAP_1G               = 0x02000000, /**< 1G supported */
@@ -1333,7 +1351,7 @@ typedef enum
 {
     EXANIC_CLK_ADJ_INC          = 0x01000000, /**< Add a tick every n ticks */
     EXANIC_CLK_ADJ_DEC          = 0x00000000, /**< Skip a tick every n ticks */
-    EXANIC_CLK_ADJ_MASK         = 0x00FFFFFF,
+    EXANIC_CLK_ADJ_MAX          = 0x00FFFFFF,
 } exanic_clk_adj_t;
 
 /**
@@ -1419,6 +1437,10 @@ typedef enum
 
     /** Set if this build variant has DDR4 DRAM fitted (X25, X100 only) */
     EXANIC_STATUS_HW_DRAM_PRES  = 0x40000,
+
+    /** Mirror output port (extended mirroring) */
+    EXANIC_FEATURE_MIRROR_OUTPUT_EXT_SHIFT  = 20,
+    EXANIC_FEATURE_MIRROR_OUTPUT_EXT_MASK   = 0xF00000,
 } exanic_feature_cfg_t;
 
 /**
@@ -1794,8 +1816,8 @@ typedef enum
 
 #define EXANIC_SUPPORTED_FECS(caps) (caps & EXANIC_CAP_25G) ? (FEC_CAPABILITY_BASER | FEC_CAPABILITY_RS_FEC) : ((caps | EXANIC_CAP_25G_S) ? (FEC_CAPABILITY_BASER) : (0))
 #define EXANIC_SUPPORTED_ETHTOOL_FECS(caps) (caps & EXANIC_CAP_25G) ? (ETHTOOL_FEC_BASER | ETHTOOL_FEC_RS) : ((caps & EXANIC_CAP_25G_S) ? (ETHTOOL_FEC_BASER) : (0))
-#define EXANIC_25G_AUTONEG_SUPPORTED_TECHS (AUTONEG_TECH_ABILITY_10G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR_S)
-#define EXANIC_25G_S_AUTONEG_SUPPORTED_TECHS (AUTONEG_TECH_ABILITY_10G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR_S)
+#define EXANIC_25G_AUTONEG_SUPPORTED_TECHS (AUTONEG_TECH_ABILITY_25G_BASE_KR | AUTONEG_TECH_ABILITY_25G_BASE_KR_S)
+#define EXANIC_25G_S_AUTONEG_SUPPORTED_TECHS (AUTONEG_TECH_ABILITY_25G_BASE_KR_S)
 
 /**
  * \brief Hash function identifiers.

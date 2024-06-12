@@ -32,8 +32,10 @@
 
 /* Linux v5.9+ introduces a sockptr_t type and the constructor function
  * USER_SOCKPTR(p), prior to this setsockopt() accepts a pointer directly */
-#ifndef _LINUX_SOCKPTR_H
-#define USER_SOCKPTR(p) (p)
+#if __USE_SOCKPTR_T
+#define __USER_SOCKPTR(p) USER_SOCKPTR(p)
+#else
+#define __USER_SOCKPTR(p) (p)
 #endif
 
 struct exasock_udp
@@ -47,6 +49,7 @@ struct exasock_udp
 
     void *                      rx_buffer;
     struct exa_socket_state *   user_page;
+    uint32_t                    next_write_hw;
 
     struct socket *             sock;
 
@@ -61,6 +64,29 @@ static DEFINE_SPINLOCK(         udp_bucket_lock);
 #define RX_BUFFER_SIZE          1048576
 
 #define NUM_BUCKETS             4096
+
+static inline void exasock_udp_update_hw_write(struct exasock_udp *udp,
+    unsigned int len)
+{
+    size_t reserve_len = exa_udp_queue_entry_size(len);
+    struct exa_udp_state *udp_state = &udp->user_page->p.udp;
+    uint32_t next_write = udp->next_write_hw;
+    uint32_t next_read = udp_state->next_read;
+
+    if (next_write + reserve_len >= udp->user_page->rx_buffer_size)
+    {
+      /* Wrap to beginning of buffer */
+      if (next_read > next_write || next_read <= reserve_len)
+      {
+        /* Cannot wrap */
+        return;
+      }
+
+      next_write = 0;
+    }
+
+    udp->next_write_hw = next_write + reserve_len;
+}
 
 static inline struct exasock_udp *stats_to_udp(struct exasock_stats_sock *stats)
 {
@@ -108,7 +134,7 @@ static void exasock_udp_stats_get_snapshot(struct exasock_stats_sock *stats,
 
     /* FIXME: for UDP recv_q count of bytes includes headers, footers and
      *        alignment padding */
-    ssbrf->recv_q = udp_state->next_write - udp_state->next_read;
+    ssbrf->recv_q = udp->next_write_hw - udp_state->next_read;
     ssbrf->send_q = 0;
 }
 
@@ -213,6 +239,7 @@ struct exasock_udp *exasock_udp_alloc(struct socket *sock, int fd)
     udp->peer_port = peer.sin_port;
     udp->rx_buffer = rx_buffer;
     udp->user_page = user_page;
+    udp->next_write_hw = 0;
     udp->sock = sock;
 
     /* Initialize stats */
@@ -395,10 +422,6 @@ static bool exasock_udp_intercept(struct sk_buff *skb)
     if (iph->protocol != IPPROTO_UDP)
         return false;
 
-    /* Multicast UDP packets are always delivered to the kernel */
-    if (ipv4_is_multicast(iph->daddr))
-        return false;
-
     /* Packet is UDP, search socket table for a match */
     uh = (struct udphdr *)(payload + iph->ihl * 4);
 
@@ -417,9 +440,7 @@ static bool exasock_udp_intercept(struct sk_buff *skb)
             udp->local_port == uh->dest &&
             udp->peer_port == uh->source)
         {
-            dev_kfree_skb_any(skb);
-            rcu_read_unlock();
-            return true;
+            goto free_skb;
         }
     }
 
@@ -436,9 +457,7 @@ static bool exasock_udp_intercept(struct sk_buff *skb)
             udp->local_port == uh->dest &&
             udp->peer_port == 0)
         {
-            dev_kfree_skb_any(skb);
-            rcu_read_unlock();
-            return true;
+            goto free_skb;
         }
     }
 
@@ -455,14 +474,18 @@ static bool exasock_udp_intercept(struct sk_buff *skb)
             udp->local_port == uh->dest &&
             udp->peer_port == 0)
         {
-            dev_kfree_skb_any(skb);
-            rcu_read_unlock();
-            return true;
+            goto free_skb;
         }
     }
 
     rcu_read_unlock();
     return false;
+
+free_skb:
+    dev_kfree_skb_any(skb);
+    rcu_read_unlock();
+    exasock_udp_update_hw_write(udp, ntohs(uh->len) - sizeof(struct udphdr));
+    return true;
 }
 
 int exasock_udp_setsockopt(struct exasock_udp *udp, int level, int optname,
@@ -475,15 +498,15 @@ int exasock_udp_setsockopt(struct exasock_udp *udp, int level, int optname,
     BUG_ON(udp->hdr.socket.type != SOCK_DGRAM);
 
     if (level == SOL_SOCKET)
-        ret = sock_setsockopt(udp->sock, level, optname, USER_SOCKPTR(optval), optlen);
+        ret = sock_setsockopt(udp->sock, level, optname, __USER_SOCKPTR(optval), optlen);
     else
-        ret = udp->sock->ops->setsockopt(udp->sock, level, optname, USER_SOCKPTR(optval), optlen);
+        ret = udp->sock->ops->setsockopt(udp->sock, level, optname, __USER_SOCKPTR(optval), optlen);
 
     return ret;
 }
 
 int exasock_udp_getsockopt(struct exasock_udp *udp, int level, int optname,
-                           char __user *optval, unsigned int *optlen)
+                           char __user *optval, unsigned int __user *optlen)
 {
     BUG_ON(udp->hdr.type != EXASOCK_TYPE_SOCKET);
     BUG_ON(udp->hdr.socket.domain != AF_INET);
